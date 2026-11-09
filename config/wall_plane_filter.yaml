@@ -1,0 +1,190 @@
+wall_plane_filter:
+  ros__parameters:
+    # 使用 bag 的 /clock。回放时要加 --clock，暂停 bag 节点也会停
+    use_sim_time: true
+
+    # 3D 雷达点云话题
+    cloud_topic: /vanjee/lidar
+    # 节点对雷达和深度都同时订阅 reliable 与 best-effort，只保留这个参数兼容旧配置。
+    lidar_sub_reliable: true
+    # 空字符串表示用点云 header.frame_id 作为雷达系（射线原点、z 裁剪轴）
+    lidar_frame: ""
+    # 雷达过滤和雷达墙拟合所在的机器人坐标系
+    target_frame: base_link
+
+    # 剔除雷达坐标系下、沿雷达 z 轴落在 [down, up]（米）内的点
+    lidar_z_cut_enable: true
+    lidar_z_cut_down: -0.15
+    lidar_z_cut_up: 0.15
+    # 上述高度带只作用于到雷达 z 轴的水平距离小于该值（米）的点。
+    # 更远的墙即使处在传感器高度也保留。
+    lidar_z_cut_range_max: 1.5
+    # 3D 雷达找墙开关。参数见 lidar_hough，Marker 发到输出坐标系
+    lidar_wall_enable: true
+    # 只对水平距离不超过该值（米）的雷达点做墙面拟合
+    lidar_wall_range_max: 3.0
+    # 按每一圈的距离轮廓去掉朝向雷达凸出的浅弓形（墙边毛刺）
+    wall_edge_enable: true
+    # 相对邻域距离凸出 edge_min～edge_max（米）才算弓形
+    edge_min: 0.04
+    edge_max: 0.45
+    # 估计这一圈“墙距离”时，左右各看这么多度
+    ring_bow_half_deg: 12.0
+    # 按俯仰角分圈的分辨率（度）
+    ap_el_res_deg: 1.0
+    # 弓形凸出超过该深度（米）视为真实障碍，保留不删
+    ap_keep_depth: 0.40
+
+    # 去毛点之后的雷达点云体素边长（米）；≤0 表示不降采样
+    voxel_leaf: 0.02
+    # 雷达处理频率上限（Hz）；0 表示每帧都处理
+    process_hz: 10.0
+    # 雷达点在 base_link 下保留的高度（米）
+    z_min: 0.05
+    z_max: 1.80
+    # 雷达点在 base_link 下保留的水平距离（米）
+    range_min: 0.20
+    range_max: 12.0
+    # TF 查询超时（秒）。查询用点云自己的时间戳，要盖住 TF 周期，否则四路深度都会被丢掉
+    tf_timeout: 0.25
+
+    # ======================= 深度相机 =======================
+    # camera1 前 / camera2 左前 / camera4 右前 / camera3 后
+    # 深度去噪总开关。false 时不订阅深度话题
+    depth_clean_enable: true
+    # 四路深度点云话题
+    depth_topics:
+      - /camera1/depth/points
+      - /camera2/depth/points
+      - /camera3/depth/points
+      - /camera4/depth/points
+    # 发布（都在 depth_wall_output_frame，默认 map；处理完立刻发，不合并）：
+    #   /wall_plane_filter/camera{1,2,3,4}/depth_cloud_filtered  各路深度独立发布
+    #   /wall_plane_filter/camera{1,2,3,4}/depth_cloud_deviate   各路剔除点
+    #   /wall_plane_filter/cloud_filtered   仅雷达过滤点（雷达回调内发出）
+    #   /wall_plane_filter/cloud_deviate    仅雷达剔除点
+    #   /wall_plane_filter/depth_wall_markers
+    #   /wall_plane_filter/lidar_wall_markers
+    #   /wall_plane_filter/depth_wall_planes   深度竖直墙面几何
+    #   /wall_plane_filter/lidar_wall_planes   雷达竖直墙面几何
+    # 兼容旧配置。输入不论 reliable 还是 best-effort 都会收。
+    # 过滤点云同时发 Reliable + Best Effort（本机 RViz 点云是 Reliable）。
+    # bag/节点/RViz 都要 CYCLONEDDS_URI=file:///workspace/dds_local.xml（勿用 /capella/dds.xml）。
+    depth_sub_reliable: true
+
+    # ---- 单帧预处理（每路相机回调内完成） ----
+    # base_link 下保留的高度（米）
+    depth_z_min: -0.05
+    depth_z_max: 1.50
+    # base_link 下保留的水平距离（米）
+    depth_range_min: 0.10
+    depth_range_max: 4.0
+    # 有序深度图：与上下左右任一邻居的距离差超过 max(abs, rel*距离) 就丢掉
+    # 墙边的飞点会被削掉一圈。无序点云跳过这一步
+    depth_fly_enable: true
+    depth_fly_abs_m: 0.04
+    depth_fly_rel: 0.03
+    # 3×3 距离中值，窗口里有效像素少于此数则丢掉该像素。然后行列都按步长抽点
+    depth_median_enable: true
+    depth_median_min: 5
+    depth_decimate_stride: 2
+    # 找墙用的体素边长（米）。发布点云用更细的 depth_publish_voxel
+    depth_voxel_leaf: 0.02
+    # 发布到 depth_cloud_filtered 的体素边长（米）。2 cm 才卡得住离墙 2 cm
+    depth_publish_voxel: 0.02
+    # 点到已发布墙的水平距离落在 (band, outer]（米）就丢掉。
+    # 近于 band 的留在墙上，远于 outer 的当障碍物留下
+    depth_wall_band_m: 0.03
+    depth_wall_band_outer_m: 0.15
+    # 半径离群点剔除，在体素化之后做。半径内邻居少于此数的体素丢掉
+    depth_radius_enable: true
+    depth_radius_search: 0.08
+    depth_radius_min_neighbors: 4
+    # 找墙只用水平距离不超过该值（米）的点，更远的深度噪声太大
+    depth_wall_range_max: 3.0
+    # 深度噪声约等于 k·d²（d 为到相机的距离，米）
+    depth_wall_noise_k: 0.005
+    # 预测噪声超过该值（米）的点不参与找墙。0.005·3²=0.045
+    depth_wall_noise_max: 0.045
+    # base_link 下的地面高度（米）
+    depth_ground_ref_z: 0.0
+    # z < ref_z + 该值（米）的点不参与找墙
+    depth_wall_ground_margin: 0.08
+    # 参与找墙的相机名，需与话题里的相机名一致
+    depth_wall_cameras: ["camera1", "camera2", "camera3", "camera4"]
+    # 每隔这么多秒打印一次各相机的 TF 失败率
+    depth_wall_tf_report_sec: 5.0
+    # 深度快照投影所在的坐标系
+    depth_wall_map_frame: map
+    # 各路点云和两套墙 Marker 的发布坐标系。base_link 表示用 target_frame
+    depth_wall_output_frame: map
+
+    # 深度快照处理频率（Hz）；雷达由 process_hz 限频。必须在 (0, 30]。
+    depth_wall_fuse_hz: 10.0
+    # 跨相机快照最大时间差（秒），所有点先按各自 stamp 变换到 map。
+    depth_merge_max_age: 0.5
+    # LINE_LIST 边线宽度；墙面高度用每条线支撑点的 z_min/z_max（缺省回退 hough.z_*）。
+    wall_line_width: 0.04
+    # 仅拐角点 Marker 的显示高度（米）；墙面几何不再使用该值。
+    wall_display_z: 0.10
+    # Marker 有效期（ROS 时间秒）；每个结果先 DELETEALL，空结果也清除旧线/旧面。
+    wall_marker_lifetime: 0.75
+
+    # 两种传感器共享提取器，分别配置；只在各自原始二值图上验证。
+    depth_hough:
+      resolution: 0.05              # 米/栅格；>=0.01
+      half_extent: 6.0              # 米；正方形投影范围半边长
+      max_grid_side: 512            # 格；硬性上限（最多1024），超限启动报错
+      follow_sensor: true           # true: 原点留在 map，机器人快离开半幅才整格平移
+      origin_x: -6.0                # 米；false 时固定原点，深度在 map 系
+      origin_y: -6.0                # 米；false 时固定原点
+      min_cell_points: 2            # 点/栅格；投影前体素点数
+      min_cell_height: 0.05         # 米；栅格中实测z跨度，抑制单层水平表面
+      z_min: 0.05                   # 米；投影前在 target_frame 下筛选高度
+      z_max: 1.50                   # 米；按实际地板/天花板高度调整
+      theta_deg: 1.0                # 度；Hough角度分辨率
+      votes: 10                    # 票；Hough阈值
+      min_line_length: 0.50         # 米；Hough和最终墙线的最短长度
+      hough_max_gap: 0.15           # 米；Hough检测允许连接的像素间隙
+      merge_angle_deg: 5.0          # 度；重复线段方向误差
+      merge_distance: 0.06         # 米；重复线段法向距离
+      merge_gap: 0.15              # 米；重复线段沿线最大间隙
+      parallel_angle_deg: 10.0      # 度；夹角小于此值不求交点
+      intersection_extension: 0.20  # 米；交点最多超出每条线的端点距离
+      support_band: 0.08            # 米；支撑邻域半宽，>=0.71*resolution，<=10格
+      min_support_ratio: 0.70       # 0~1；原始二值图占据支撑比例
+      max_unsupported_gap: 0.18     # 米；连续无支撑超过此值必须拆开
+      min_continuous_support: 0.15  # 米；至少有这么长的连续占据支撑
+      min_support_points: 10        # 点；最终线段附近真实三维点数
+      max_lines: 80                 # 条；Hough候选上限，限制求交开销（最多256）
+      refine: true                 # 原始支撑点TLS精修，精修后再次验证
+      debug: false                 # 发布 binary OccupancyGrid + debug_markers
+
+    lidar_hough:
+      resolution: 0.06              # 米/格
+      half_extent: 6.0              # 米
+      max_grid_side: 512            # 格
+      follow_sensor: true           # 雷达投影在 target_frame，中心为机器人原点
+      origin_x: -6.0                # 米；固定原点模式
+      origin_y: -6.0                # 米
+      min_cell_points: 2            # 点/格
+      min_cell_height: 0.05         # 米
+      z_min: 0.15                   # 米；target_frame，下限排除地面
+      z_max: 1.50                   # 米；target_frame，上限排除顶面
+      theta_deg: 1.0                # 度
+      votes: 8                     # 票
+      min_line_length: 0.50         # 米
+      hough_max_gap: 0.15           # 米
+      merge_angle_deg: 5.0          # 度
+      merge_distance: 0.08         # 米
+      merge_gap: 0.15              # 米
+      parallel_angle_deg: 10.0      # 度
+      intersection_extension: 0.20  # 米
+      support_band: 0.10            # 米；半宽
+      min_support_ratio: 0.70       # 比例
+      max_unsupported_gap: 0.18     # 米
+      min_continuous_support: 0.15  # 米
+      min_support_points: 10        # 点
+      max_lines: 80                 # 条
+      refine: true
+      debug: false
