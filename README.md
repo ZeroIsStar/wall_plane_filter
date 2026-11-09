@@ -47,3 +47,4 @@ export ROS_LOCALHOST_ONLY=0
 不要用 `/capella/dds.xml`：它绑 `docker0`，本机 `docker0` 是 down。`dds_local.xml` 强制 `eth0`、DDS 分片 1400B，并把 Best-Effort 重组槽从默认 4 提到 64（RViz 同时订 4 路深度+雷达时，默认 4 会直接丢点云）。
 
 过滤点云同时发 Reliable 和 Best Effort。你这边 RViz 点云是 Reliable，必须能对上 Reliable 发布端。Fixed Frame 用 `map`。回放要 `ros2 bag play --clock`。
+# wall_plane_filter
