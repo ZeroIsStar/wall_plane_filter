@@ -127,11 +127,12 @@ void blend(WallTracker::Track & track, const WallLine & obs, const WallTrackConf
 }
 }  // namespace
 
-WallTrackConfig trackConfigFrom(const HoughConfig & hough)
+WallTrackConfig trackConfigFrom(const HoughConfig & hough, const WallTrackConfig & base)
 {
-  WallTrackConfig config;
+  WallTrackConfig config = base;
   config.merge_angle_deg = hough.merge_angle_deg;
-  config.merge_gap = hough.merge_gap;
+  // Prefer the larger gap so association behaves like a along-track buffer.
+  config.merge_gap = std::max(base.merge_gap, hough.merge_gap);
   config.min_line_length = hough.min_line_length;
   return config;
 }
@@ -181,10 +182,12 @@ std::vector<WallLine> WallTracker::update(
       next.push_back(track);
       continue;
     }
-    // An unconfirmed streak has no support this frame. A published line stays
-    // until it has been missing longer than lose_sec.
+    // Unconfirmed tracks die immediately without a match. Confirmed tracks
+    // coast with frozen geometry until lose_sec (region-growth style hold).
     if (!track.confirmed) {continue;}
     if (stamp_sec - track.last_seen > config.lose_sec) {continue;}
+    track.shorten_lo = 0;
+    track.shorten_hi = 0;
     next.push_back(track);
   }
   for (int o = 0; o < n_obs; ++o) {
@@ -199,6 +202,11 @@ std::vector<WallLine> WallTracker::update(
     next.push_back(track);
   }
   tracks_.swap(next);
+  return confirmed();
+}
+
+std::vector<WallLine> WallTracker::confirmed() const
+{
   std::vector<WallLine> published;
   for (const auto & track : tracks_) {
     if (track.confirmed) {published.push_back(track.line);}

@@ -90,7 +90,7 @@ Visualization Manager:
     Queue Size: 5
     Decay Time: 0
   - Class: rviz_default_plugins/MarkerArray
-    Name: depth final walls
+    Name: depth walls (all cams)
     Enabled: true
     Marker Topic:
       Value: /wall_plane_filter/depth_wall_markers
@@ -99,7 +99,7 @@ Visualization Manager:
       Depth: 1
     Queue Size: 10
   - Class: rviz_default_plugins/MarkerArray
-    Name: lidar final walls
+    Name: lidar walls
     Enabled: true
     Marker Topic:
       Value: /wall_plane_filter/lidar_wall_markers

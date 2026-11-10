@@ -40,6 +40,7 @@ find_package(PCL REQUIRED COMPONENTS common kdtree search filters)
 rosidl_generate_interfaces(${PROJECT_NAME}
   "msg/WallPlane.msg"
   "msg/WallPlaneArray.msg"
+  "msg/ElevatorDoorStatus.msg"
   DEPENDENCIES geometry_msgs std_msgs
 )
 

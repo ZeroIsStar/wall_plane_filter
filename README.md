@@ -23,16 +23,25 @@ colcon build --packages-select wall_plane_filter --symlink-install \
 - `/wall_plane_filter/camera1/depth_cloud_filtered`（camera2、camera3、camera4 同样命名）
 - `/wall_plane_filter/camera1/depth_cloud_deviate`（各路剔除点）
 
-每路保留自己的输入时间戳，坐标系为 `depth_wall_output_frame`。原 `cloud_filtered/cloud_deviate` 仅发布雷达数据。找墙仍在内部融合四路证据。
+每路保留自己的输入时间戳，坐标系为 `depth_wall_output_frame`。原 `cloud_filtered/cloud_deviate` 仅发布雷达数据。
 
-深度过滤点云在各相机回调完成后立即发布；雷达过滤点云在雷达回调处理完后立即发布。两者都不合并，也不等找墙。10 Hz 的融合周期只汇集深度找墙证据、发深度墙 Marker，并按最新墙线再刷一次深度点云的墙带剔除。
+深度过滤点云、雷达过滤点云都在各自回调处理完后立即发布，互不合并。
 
-跟踪后的竖直墙面几何：
+墙带剔除按竖直墙法向距离 `|n·xy−ρ|`：有效带宽 `keep=max(band, min(noise_max, k·r²))`，`≤keep` 投影到墙面共面，`(keep, outer]` 进 deviate，更远当障碍物保留。深度用当前跟踪墙；雷达用上一帧已确认墙。尚无墙线时对局部平面片做 PCA（`depth_local_flatten_*`）；有墙后只靠墙带投影。图像侧用 5×5 距离中值压慢起伏。
 
-- `/wall_plane_filter/depth_wall_planes`（`wall_plane_filter/WallPlaneArray`）
+墙跟踪稳态（`wall_track`）：确认后丢检可保持 `lose_sec`；端点只涨不急缩；空观测重发上一帧 Marker 并刷新 lifetime（coasting）。
+
+电梯门：`/wall_plane_filter/elevator_door_status`（`ElevatorDoorStatus`）。在 `base_link` 前方门宽 ROI 按横向分箱，近平面为关、更远缺口为开，多帧投票。`state`: 0 UNKNOWN / 1 OPEN / 2 CLOSED。
+
+深度找墙与雷达一样：每路相机回调内独立 Hough + map 跟踪，立刻发布，不再等融合定时器。
+
+竖直墙面几何：
+
+- `/wall_plane_filter/camera{1,2,3,4}/wall_planes`（该路立刻发布）
+- `/wall_plane_filter/depth_wall_planes`（四路跟踪结果汇总）
 - `/wall_plane_filter/lidar_wall_planes`
 
-每条墙：`normal·[x,y]=rho`，高度 `[z_min,z_max]`，水平跨度 `a→b`，并带四角 `corners`。同话题 Marker 里还有半透明 `TRIANGLE_LIST` 面片。
+每条墙：`normal·[x,y]=rho`，高度 `[z_min,z_max]`，水平跨度 `a→b`，并带四角 `corners`。Marker 里还有半透明 `TRIANGLE_LIST` 面片。
 
 ## WSL bag + 容器节点 + WSL RViz
 
