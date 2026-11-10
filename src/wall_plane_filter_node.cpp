@@ -10,13 +10,18 @@
 
 #include <pcl/filters/radius_outlier_removal.h>
 #include <pcl/filters/voxel_grid.h>
+#include <pcl/kdtree/kdtree_flann.h>
 #include <pcl_conversions/pcl_conversions.h>
+
+#include <Eigen/Eigenvalues>
 
 #include <algorithm>
 #include <cmath>
 #include <cstdint>
+#include <deque>
 #include <iomanip>
 #include <limits>
+#include <mutex>
 #include <sstream>
 #include <stdexcept>
 #include <utility>
@@ -45,9 +50,8 @@ float cameraRange(const pcl::PointXYZ & p)
   return r > 1e-4f ? r : std::numeric_limits<float>::quiet_NaN();
 }
 
-// Flying pixels, 3x3 range median, then stride decimation. Neighborhood is the
-// depth image, so this only runs on an organized cloud. Output points stay on
-// the original camera ray. fly receives the raw pixels rejected as edges.
+// Flying pixels (8-neigh), optional median with edge MAD gate, then stride decimation.
+// Organized clouds only; output stays on the camera ray. fly gets rejected edges.
 void denoiseDepthImage(const CloudT & in, const Params & params, CloudT & kept, CloudT & fly)
 {
   kept.clear();
@@ -78,8 +82,9 @@ void denoiseDepthImage(const CloudT & in, const Params & params, CloudT & kept, 
   if (params.depth_fly_enable) {
     const float abs_m = static_cast<float>(std::max(0.0, params.depth_fly_abs_m));
     const float rel = static_cast<float>(std::max(0.0, params.depth_fly_rel));
-    const int du[4] = {1, -1, 0, 0};
-    const int dv[4] = {0, 0, 1, -1};
+    const int need_bad = std::clamp(params.depth_fly_min_neighbors, 1, 8);
+    const int du[8] = {1, -1, 0, 0, 1, 1, -1, -1};
+    const int dv[8] = {0, 0, 1, -1, 1, -1, 1, -1};
     for (int v = 0; v < h; ++v) {
       for (int u = 0; u < w; ++u) {
         const size_t i = static_cast<size_t>(v * w + u);
@@ -88,7 +93,8 @@ void denoiseDepthImage(const CloudT & in, const Params & params, CloudT & kept, 
           continue;
         }
         const float lim = std::max(abs_m, rel * r);
-        for (int k = 0; k < 4; ++k) {
+        int bad = 0;
+        for (int k = 0; k < 8; ++k) {
           const int uu = u + du[k];
           const int vv = v + dv[k];
           if (uu < 0 || vv < 0 || uu >= w || vv >= h) {
@@ -99,8 +105,11 @@ void denoiseDepthImage(const CloudT & in, const Params & params, CloudT & kept, 
             continue;
           }
           if (std::fabs(r - rn) > lim) {
-            flying[i] = 1;
-            break;
+            ++bad;
+            if (bad >= need_bad) {
+              flying[i] = 1;
+              break;
+            }
           }
         }
       }
@@ -116,8 +125,10 @@ void denoiseDepthImage(const CloudT & in, const Params & params, CloudT & kept, 
 
   std::vector<float> med = range;
   if (params.depth_median_enable) {
+    const int half = std::clamp(params.depth_median_half, 1, 3);
     const int need = std::max(1, params.depth_median_min);
-    float window[9];
+    const float edge_mad = static_cast<float>(std::max(0.0, params.depth_median_edge_mad));
+    std::vector<float> window(static_cast<size_t>((2 * half + 1) * (2 * half + 1)));
     for (int v = 0; v < h; ++v) {
       for (int u = 0; u < w; ++u) {
         const size_t i = static_cast<size_t>(v * w + u);
@@ -126,8 +137,8 @@ void denoiseDepthImage(const CloudT & in, const Params & params, CloudT & kept, 
           continue;
         }
         int count = 0;
-        for (int dv = -1; dv <= 1; ++dv) {
-          for (int du = -1; du <= 1; ++du) {
+        for (int dv = -half; dv <= half; ++dv) {
+          for (int du = -half; du <= half; ++du) {
             const int uu = u + du;
             const int vv = v + dv;
             if (uu < 0 || vv < 0 || uu >= w || vv >= h) {
@@ -137,23 +148,38 @@ void denoiseDepthImage(const CloudT & in, const Params & params, CloudT & kept, 
             if (flying[j] || !std::isfinite(range[j])) {
               continue;
             }
-            window[count++] = range[j];
+            window[static_cast<size_t>(count++)] = range[j];
           }
         }
         if (count < need) {
           med[i] = std::numeric_limits<float>::quiet_NaN();
           continue;
         }
-        std::nth_element(window, window + count / 2, window + count);
-        med[i] = window[count / 2];
+        std::nth_element(window.begin(), window.begin() + count / 2, window.begin() + count);
+        const float median = window[static_cast<size_t>(count / 2)];
+        // MAD: skip median scale on strong edges (zipper).
+        if (edge_mad > 0.0f) {
+          for (int c = 0; c < count; ++c) {
+            window[static_cast<size_t>(c)] = std::fabs(window[static_cast<size_t>(c)] - median);
+          }
+          std::nth_element(window.begin(), window.begin() + count / 2, window.begin() + count);
+          const float mad = window[static_cast<size_t>(count / 2)];
+          if (mad > edge_mad) {
+            med[i] = range[i];
+            continue;
+          }
+        }
+        med[i] = median;
       }
     }
   }
 
   const int stride = std::max(1, params.depth_decimate_stride);
+  const int v0 = stride / 2;
+  const int u0 = stride / 2;
   kept.reserve(n / static_cast<size_t>(stride * stride));
-  for (int v = 0; v < h; v += stride) {
-    for (int u = 0; u < w; u += stride) {
+  for (int v = v0; v < h; v += stride) {
+    for (int u = u0; u < w; u += stride) {
       const size_t i = static_cast<size_t>(v * w + u);
       const float r = range[i];
       const float m = med[i];
@@ -228,17 +254,6 @@ geometry_msgs::msg::Point pointMsg(const Eigen::Vector3d & p)
   return g;
 }
 
-double segDist2(const Eigen::Vector2d & p, const Eigen::Vector2d & a, const Eigen::Vector2d & b)
-{
-  const Eigen::Vector2d ab = b - a;
-  const double len2 = ab.squaredNorm();
-  double t = 0.0;
-  if (len2 > 1e-12) {
-    t = std::clamp((p - a).dot(ab) / len2, 0.0, 1.0);
-  }
-  return (p - (a + t * ab)).norm();
-}
-
 WallLine transformLine(const WallLine & line, const Eigen::Isometry3d & tf)
 {
   const double z0 = std::isfinite(line.z_min) ? line.z_min : 0.0;
@@ -286,44 +301,344 @@ std::vector<Eigen::Vector2d> transformPoints(
   return out;
 }
 
-double distToPoly(const Eigen::Vector2d & p, const std::vector<Eigen::Vector2d> & xy)
+// Nearest finite wall by plane-normal distance. Endpoints get a small along-track
+// margin so corners are not over-aggressively culled.
+bool nearestWallNormal(
+  const Eigen::Vector2d & xy, const std::vector<WallLine> & walls, double end_margin,
+  double & abs_d, double & signed_d, Eigen::Vector2d & normal_out)
 {
-  double best = std::numeric_limits<double>::infinity();
-  for (size_t i = 1; i < xy.size(); ++i) {
-    best = std::min(best, segDist2(p, xy[i - 1], xy[i]));
+  abs_d = std::numeric_limits<double>::infinity();
+  signed_d = 0.0;
+  normal_out = Eigen::Vector2d::Zero();
+  bool found = false;
+  for (const auto & wall : walls) {
+    Eigen::Vector2d n = wall.normal;
+    const double nn = n.norm();
+    if (nn < 1e-9) {
+      continue;
+    }
+    n /= nn;
+    const double rho = n.dot(wall.a);
+    const double sd = n.dot(xy) - rho;
+    const double ad = std::abs(sd);
+
+    Eigen::Vector2d dir = wall.b - wall.a;
+    const double len = dir.norm();
+    if (len < 1e-9) {
+      continue;
+    }
+    dir /= len;
+    const double t = dir.dot(xy - wall.a);
+    // Off the finite segment: fall back to endpoint distance (no plane project).
+    if (t < -end_margin || t > len + end_margin) {
+      const double d_end = std::min((xy - wall.a).norm(), (xy - wall.b).norm());
+      if (d_end < abs_d) {
+        abs_d = d_end;
+        signed_d = sd;
+        normal_out = Eigen::Vector2d::Zero();  // mark: not on-segment
+        found = true;
+      }
+      continue;
+    }
+    if (ad < abs_d) {
+      abs_d = ad;
+      signed_d = sd;
+      normal_out = n;
+      found = true;
+    }
   }
-  return best;
+  return found;
 }
 
-// Points in (keep, outer] of a published wall are the smear around the surface.
-// Points farther than outer are obstacles and are kept.
-size_t cullWallBand(
-  CloudT & cloud, CloudT & deviate, const std::vector<std::vector<Eigen::Vector2d>> & walls,
-  double keep, double outer)
+struct LocalPlaneFeat
 {
+  bool valid{false};
+  Eigen::Vector3d normal{Eigen::Vector3d::UnitZ()};
+  double curvature{1.0};
+};
+
+bool computeLocalPlaneFeat(
+  const CloudT & cloud, pcl::KdTreeFLANN<pcl::PointXYZ> & tree, size_t idx,
+  double radius, int min_neighbors, LocalPlaneFeat & out)
+{
+  out.valid = false;
+  std::vector<int> ids;
+  std::vector<float> dist2;
+  const int need = std::max(3, min_neighbors);
+  if (tree.radiusSearch(cloud.points[idx], radius, ids, dist2) < need) {
+    return false;
+  }
+  Eigen::Vector3d mean = Eigen::Vector3d::Zero();
+  for (int id : ids) {
+    const auto & q = cloud.points[static_cast<size_t>(id)];
+    mean += Eigen::Vector3d(q.x, q.y, q.z);
+  }
+  mean /= static_cast<double>(ids.size());
+  Eigen::Matrix3d cov = Eigen::Matrix3d::Zero();
+  for (int id : ids) {
+    const auto & q = cloud.points[static_cast<size_t>(id)];
+    const Eigen::Vector3d d = Eigen::Vector3d(q.x, q.y, q.z) - mean;
+    cov += d * d.transpose();
+  }
+  Eigen::SelfAdjointEigenSolver<Eigen::Matrix3d> eig(cov);
+  if (eig.info() != Eigen::Success) {
+    return false;
+  }
+  const Eigen::Vector3d evals = eig.eigenvalues();
+  const double sum = evals.sum();
+  if (!(sum > 1e-12)) {
+    return false;
+  }
+  out.curvature = evals(0) / sum;
+  out.normal = eig.eigenvectors().col(0);
+  out.valid = true;
+  return true;
+}
+
+// Cull smear around tracked walls and project inliers onto the plane.
+// keep is expanded per-point with k·r² noise (r = distance to sensor_xy).
+// Optional local-flatness gate avoids projecting near-wall obstacles.
+size_t cullWallBand(
+  CloudT & cloud, CloudT & deviate, const std::vector<WallLine> & walls,
+  double keep, double outer, bool project,
+  const Eigen::Vector2d & robot_xy, double noise_k, double noise_max,
+  size_t * projected_out = nullptr,
+  const Eigen::Vector2d * sensor_xy = nullptr,
+  const Params * local_params = nullptr)
+{
+  if (projected_out) {
+    *projected_out = 0;
+  }
   if (cloud.empty() || walls.empty() || !(keep > 0.0) || !(outer > keep)) {
     return 0;
   }
+  const Eigen::Vector2d noise_origin = sensor_xy ? *sensor_xy : robot_xy;
+  const bool local_check = local_params && local_params->wall_project_local_check && project;
+  const double end_margin = std::max({keep, outer * 0.5, 0.12});
+
+  pcl::KdTreeFLANN<pcl::PointXYZ> tree;
+  std::vector<char> candidate(cloud.size(), 0);
+  size_t candidate_n = 0;
+  if (local_check) {
+    // Only points near a wall band need PCA features.
+    for (size_t i = 0; i < cloud.size(); ++i) {
+      const Eigen::Vector2d xy(cloud.points[i].x, cloud.points[i].y);
+      double abs_d = 0.0;
+      double signed_d = 0.0;
+      Eigen::Vector2d n = Eigen::Vector2d::Zero();
+      if (!nearestWallNormal(xy, walls, end_margin, abs_d, signed_d, n)) {
+        continue;
+      }
+      if (!(n.squaredNorm() > 0.5)) {
+        continue;
+      }
+      const double range = (xy - noise_origin).norm();
+      const double noise = std::min(noise_max, noise_k * range * range);
+      const double keep_pt = std::max(keep, noise);
+      const double outer_pt = std::max(outer, keep_pt + 0.02);
+      if (abs_d <= outer_pt) {
+        candidate[i] = 1;
+        ++candidate_n;
+      }
+    }
+    if (candidate_n > 0) {
+      tree.setInputCloud(cloud.makeShared());
+    }
+  }
+
   CloudT kept;
   kept.reserve(cloud.size());
   size_t dropped = 0;
-  for (const auto & p : cloud.points) {
+  size_t projected = 0;
+  const double cos_n =
+    local_check ? std::cos(local_params->wall_project_normal_deg * M_PI / 180.0) : 0.0;
+  for (size_t i = 0; i < cloud.size(); ++i) {
+    const auto & p = cloud.points[i];
     const Eigen::Vector2d xy(p.x, p.y);
-    double best = std::numeric_limits<double>::infinity();
-    for (const auto & wall : walls) {
-      best = std::min(best, distToPoly(xy, wall));
+    double abs_d = 0.0;
+    double signed_d = 0.0;
+    Eigen::Vector2d n = Eigen::Vector2d::Zero();
+    if (!nearestWallNormal(xy, walls, end_margin, abs_d, signed_d, n)) {
+      kept.push_back(p);
+      continue;
     }
-    if (best > keep && best <= outer) {
+    const bool on_segment = n.squaredNorm() > 0.5;
+    const double range = (xy - noise_origin).norm();
+    const double noise = std::min(noise_max, noise_k * range * range);
+    const double keep_pt = std::max(keep, noise);
+    const double outer_pt = std::max(outer, keep_pt + 0.02);
+    if (on_segment && abs_d > keep_pt && abs_d <= outer_pt) {
       deviate.push_back(p);
       ++dropped;
-    } else {
-      kept.push_back(p);
+      continue;
     }
+    if (on_segment && abs_d <= keep_pt && project) {
+      bool do_project = true;
+      if (local_check && candidate[i]) {
+        LocalPlaneFeat feat;
+        if (!computeLocalPlaneFeat(
+            cloud, tree, i, local_params->wall_project_radius,
+            local_params->wall_project_min_neighbors, feat) ||
+          feat.curvature > local_params->wall_project_max_curvature)
+        {
+          do_project = false;
+        } else {
+          const Eigen::Vector3d wall_n(n.x(), n.y(), 0.0);
+          if (std::abs(feat.normal.dot(wall_n)) < cos_n) {
+            do_project = false;
+          }
+        }
+      }
+      if (do_project) {
+        pcl::PointXYZ q = p;
+        q.x = static_cast<float>(p.x - signed_d * n.x());
+        q.y = static_cast<float>(p.y - signed_d * n.y());
+        kept.push_back(q);
+        ++projected;
+        continue;
+      }
+      kept.push_back(p);
+      continue;
+    }
+    kept.push_back(p);
   }
   cloud = std::move(kept);
   finishCloud(cloud);
   finishCloud(deviate);
+  if (projected_out) {
+    *projected_out = projected;
+  }
   return dropped;
+}
+
+// Project points that sit on locally flat patches onto their neighborhood plane.
+// Caps work to max_points via stride sampling to protect callback latency.
+size_t flattenLocalPlanes(
+  CloudT & cloud, double radius, int min_neighbors, double max_curvature, int max_points = 2000)
+{
+  if (cloud.size() < static_cast<size_t>(std::max(3, min_neighbors)) ||
+    !(radius > 1e-4) || !(max_curvature > 0.0))
+  {
+    return 0;
+  }
+  const int cap = std::max(3, max_points);
+  const size_t step = std::max<size_t>(1, cloud.size() / static_cast<size_t>(cap));
+  pcl::KdTreeFLANN<pcl::PointXYZ> tree;
+  auto input = cloud.makeShared();
+  tree.setInputCloud(input);
+  CloudT out = cloud;
+  size_t flattened = 0;
+  const int need = std::max(3, min_neighbors);
+  for (size_t i = 0; i < cloud.size(); i += step) {
+    LocalPlaneFeat feat;
+    if (!computeLocalPlaneFeat(cloud, tree, i, radius, need, feat)) {
+      continue;
+    }
+    if (feat.curvature > max_curvature) {
+      continue;
+    }
+    Eigen::Vector3d mean = Eigen::Vector3d::Zero();
+    std::vector<int> ids;
+    std::vector<float> dist2;
+    if (tree.radiusSearch(cloud.points[i], radius, ids, dist2) < need) {
+      continue;
+    }
+    for (int id : ids) {
+      const auto & q = cloud.points[static_cast<size_t>(id)];
+      mean += Eigen::Vector3d(q.x, q.y, q.z);
+    }
+    mean /= static_cast<double>(ids.size());
+    const Eigen::Vector3d p(cloud.points[i].x, cloud.points[i].y, cloud.points[i].z);
+    const Eigen::Vector3d q = p - feat.normal * feat.normal.dot(p - mean);
+    out.points[i].x = static_cast<float>(q.x());
+    out.points[i].y = static_cast<float>(q.y());
+    out.points[i].z = static_cast<float>(q.z());
+    ++flattened;
+  }
+  cloud.swap(out);
+  finishCloud(cloud);
+  return flattened;
+}
+
+bool tryFuseWallLine(
+  WallLine & a, const WallLine & b, double merge_angle_deg, double merge_distance, double merge_gap)
+{
+  const Eigen::Vector2d da = (a.b - a.a);
+  const double la = da.norm();
+  if (la < 1e-9) {
+    return false;
+  }
+  const Eigen::Vector2d d = da / la;
+  const Eigen::Vector2d db = (b.b - b.a);
+  const double lb = db.norm();
+  if (lb < 1e-9) {
+    return false;
+  }
+  const Eigen::Vector2d dbn = db / lb;
+  if (std::abs(d.dot(dbn)) < std::cos(merge_angle_deg * M_PI / 180.0)) {
+    return false;
+  }
+  if (std::abs(a.normal.dot(b.a) - a.rho) > merge_distance ||
+    std::abs(a.normal.dot(b.b) - a.rho) > merge_distance)
+  {
+    return false;
+  }
+  const double t0 = d.dot(b.a - a.a);
+  const double t1 = d.dot(b.b - a.a);
+  const double lo = std::min(t0, t1);
+  const double hi = std::max(t0, t1);
+  if (lo > la + merge_gap || hi < -merge_gap) {
+    return false;
+  }
+  const double wa = static_cast<double>(std::max<size_t>(1, a.support_points));
+  const double wb = static_cast<double>(std::max<size_t>(1, b.support_points));
+  const double ratio_a = a.support_ratio;
+  const double sigma_a = a.sigma;
+  Eigen::Vector2d n = (wa * a.normal + wb * b.normal).normalized();
+  if (n.dot(a.normal) < 0.0) {
+    n = -n;
+  }
+  const Eigen::Vector2d a0 = a.a + d * std::min(0.0, lo);
+  const Eigen::Vector2d a1 = a.a + d * std::max(la, hi);
+  a.a = a0;
+  a.b = a1;
+  a.normal = n;
+  a.rho = n.dot(a.a);
+  a.z_min = std::min(a.z_min, b.z_min);
+  a.z_max = std::max(a.z_max, b.z_max);
+  a.support_points = a.support_points + b.support_points;
+  a.support_ratio = (wa * ratio_a + wb * b.support_ratio) / (wa + wb);
+  a.sigma = (wa * sigma_a + wb * b.sigma) / (wa + wb);
+  return true;
+}
+
+std::vector<WallLine> fuseWallLines(
+  const std::vector<WallLine> & lines, double merge_angle_deg, double merge_distance,
+  double merge_gap, int min_support_points)
+{
+  std::vector<WallLine> filtered;
+  filtered.reserve(lines.size());
+  const size_t min_pts = static_cast<size_t>(std::max(1, min_support_points));
+  for (const auto & line : lines) {
+    if (line.support_points >= min_pts) {
+      filtered.push_back(line);
+    }
+  }
+  std::vector<WallLine> merged;
+  merged.reserve(filtered.size());
+  for (const auto & line : filtered) {
+    bool fused = false;
+    for (auto & prev : merged) {
+      if (tryFuseWallLine(prev, line, merge_angle_deg, merge_distance, merge_gap)) {
+        fused = true;
+        break;
+      }
+    }
+    if (!fused) {
+      merged.push_back(line);
+    }
+  }
+  return merged;
 }
 
 }  // namespace
@@ -355,6 +670,8 @@ WallPlaneFilterNode::WallPlaneFilterNode(const rclcpp::NodeOptions & options)
     "/wall_plane_filter/lidar_wall_planes", rclcpp::QoS(1).reliable());
   depth_wall_plane_pub_ = create_publisher<wall_plane_filter::msg::WallPlaneArray>(
     "/wall_plane_filter/depth_wall_planes", rclcpp::QoS(1).reliable());
+  elevator_door_pub_ = create_publisher<wall_plane_filter::msg::ElevatorDoorStatus>(
+    "/wall_plane_filter/elevator_door_status", rclcpp::QoS(1).reliable().transient_local());
 
   if (params_.depth_hough.debug) {
     depth_grid_pub_ = create_publisher<nav_msgs::msg::OccupancyGrid>(
@@ -403,9 +720,14 @@ WallPlaneFilterNode::WallPlaneFilterNode(const rclcpp::NodeOptions & options)
       deviate_topic, cloud_rel));
     depth_deviate_pubs_be_.push_back(create_publisher<sensor_msgs::msg::PointCloud2>(
       deviate_topic, cloud_be));
+    depth_cam_plane_pubs_.push_back(create_publisher<wall_plane_filter::msg::WallPlaneArray>(
+      "/wall_plane_filter/" + cam + "/wall_planes", rclcpp::QoS(1).reliable()));
     depth_cam_names_.push_back(cam);
     depth_find_walls_.push_back(find_walls ? 1 : 0);
     depth_slots_.emplace_back();
+    depth_cam_tracks_.emplace_back();
+    depth_grid_origins_.emplace_back(Eigen::Vector2d::Zero());
+    depth_grid_valid_.push_back(0);
     depth_tf_total_.push_back(0);
     depth_tf_fail_.push_back(0);
     const size_t idx = depth_slots_.size() - 1;
@@ -418,17 +740,9 @@ WallPlaneFilterNode::WallPlaneFilterNode(const rclcpp::NodeOptions & options)
       topic, rclcpp::SensorDataQoS().keep_last(2).best_effort(), depth_cb));
   }
 
-  // Node clock follows use_sim_time, so a paused bag pauses fusion too.
-  if (params_.depth_wall_fuse_hz > 1e-3) {
-    wall_fuse_timer_ = rclcpp::create_timer(
-      this, get_clock(),
-      rclcpp::Duration::from_seconds(1.0 / params_.depth_wall_fuse_hz),
-      [this]() {wallFuseTick();});
-  }
-
   RCLCPP_INFO(
     get_logger(),
-    "lidar z-cut [%.2f, %.2f] range<%.2f wall_edge=%d cloud=%s",
+    "lidar z-cut [%.2f, %.2f] range<%.2f wall_edge=%d cloud=%s depth_walls=per_camera",
     params_.lidar_z_cut_down, params_.lidar_z_cut_up, params_.lidar_z_cut_range_max,
     params_.wall_edge_enable ? 1 : 0, params_.cloud_topic.c_str());
 }
@@ -476,12 +790,43 @@ void WallPlaneFilterNode::loadParams()
   take("depth_publish_voxel", params_.depth_publish_voxel, d.depth_publish_voxel);
   take("depth_wall_band_m", params_.depth_wall_band_m, d.depth_wall_band_m);
   take("depth_wall_band_outer_m", params_.depth_wall_band_outer_m, d.depth_wall_band_outer_m);
+  take("depth_wall_project", params_.depth_wall_project, d.depth_wall_project);
+  take("depth_local_flatten_enable", params_.depth_local_flatten_enable, d.depth_local_flatten_enable);
+  take("depth_local_flatten_radius", params_.depth_local_flatten_radius, d.depth_local_flatten_radius);
+  take(
+    "depth_local_flatten_min_neighbors", params_.depth_local_flatten_min_neighbors,
+    d.depth_local_flatten_min_neighbors);
+  take(
+    "depth_local_flatten_max_curvature", params_.depth_local_flatten_max_curvature,
+    d.depth_local_flatten_max_curvature);
+  take(
+    "depth_local_flatten_max_points", params_.depth_local_flatten_max_points,
+    d.depth_local_flatten_max_points);
   take("depth_fly_enable", params_.depth_fly_enable, d.depth_fly_enable);
   take("depth_fly_abs_m", params_.depth_fly_abs_m, d.depth_fly_abs_m);
   take("depth_fly_rel", params_.depth_fly_rel, d.depth_fly_rel);
+  take("depth_fly_min_neighbors", params_.depth_fly_min_neighbors, d.depth_fly_min_neighbors);
+  params_.depth_fly_min_neighbors = std::clamp(params_.depth_fly_min_neighbors, 1, 8);
   take("depth_median_enable", params_.depth_median_enable, d.depth_median_enable);
+  take("depth_median_half", params_.depth_median_half, d.depth_median_half);
   take("depth_median_min", params_.depth_median_min, d.depth_median_min);
+  take("depth_median_edge_mad", params_.depth_median_edge_mad, d.depth_median_edge_mad);
   take("depth_decimate_stride", params_.depth_decimate_stride, d.depth_decimate_stride);
+  take("wall_project_local_check", params_.wall_project_local_check, d.wall_project_local_check);
+  take("wall_project_radius", params_.wall_project_radius, d.wall_project_radius);
+  take("wall_project_normal_deg", params_.wall_project_normal_deg, d.wall_project_normal_deg);
+  take(
+    "wall_project_max_curvature", params_.wall_project_max_curvature,
+    d.wall_project_max_curvature);
+  take(
+    "wall_project_min_neighbors", params_.wall_project_min_neighbors,
+    d.wall_project_min_neighbors);
+  take(
+    "wall_fuse_min_support_points", params_.wall_fuse_min_support_points,
+    d.wall_fuse_min_support_points);
+  take(
+    "depth_cull_use_global_walls", params_.depth_cull_use_global_walls,
+    d.depth_cull_use_global_walls);
   take("depth_wall_range_max", params_.depth_wall_range_max, d.depth_wall_range_max);
   take("depth_wall_fuse_hz", params_.depth_wall_fuse_hz, d.depth_wall_fuse_hz);
   take("depth_wall_cameras", params_.depth_wall_cameras, d.depth_wall_cameras);
@@ -531,6 +876,36 @@ void WallPlaneFilterNode::loadParams()
   };
   hough("depth_hough", params_.depth_hough);
   hough("lidar_hough", params_.lidar_hough);
+  {
+    WallTrackConfig & t = params_.wall_track;
+    const WallTrackConfig td;
+    take("wall_track.normal_gate", t.normal_gate, td.normal_gate);
+    take("wall_track.merge_gap", t.merge_gap, td.merge_gap);
+    take("wall_track.obs_weight", t.obs_weight, td.obs_weight);
+    take("wall_track.confirm_frames", t.confirm_frames, td.confirm_frames);
+    take("wall_track.shorten_frames", t.shorten_frames, td.shorten_frames);
+    take("wall_track.lose_sec", t.lose_sec, td.lose_sec);
+    if (!(t.lose_sec > 0.0) || t.confirm_frames < 1 || t.shorten_frames < 1 ||
+      !(t.normal_gate > 0.0) || !(t.merge_gap >= 0.0) ||
+      t.obs_weight < 0.0 || t.obs_weight > 1.0)
+    {
+      throw std::invalid_argument("Invalid wall_track temporal parameters");
+    }
+  }
+  take("elevator_door_enable", params_.elevator_door_enable, d.elevator_door_enable);
+  take("elevator_door_x_min", params_.elevator_door_x_min, d.elevator_door_x_min);
+  take("elevator_door_x_max", params_.elevator_door_x_max, d.elevator_door_x_max);
+  take("elevator_door_half_width", params_.elevator_door_half_width, d.elevator_door_half_width);
+  take("elevator_door_z_min", params_.elevator_door_z_min, d.elevator_door_z_min);
+  take("elevator_door_z_max", params_.elevator_door_z_max, d.elevator_door_z_max);
+  take("elevator_door_open_margin", params_.elevator_door_open_margin, d.elevator_door_open_margin);
+  take("elevator_door_open_ratio", params_.elevator_door_open_ratio, d.elevator_door_open_ratio);
+  take("elevator_door_bins", params_.elevator_door_bins, d.elevator_door_bins);
+  take("elevator_door_min_points_bin", params_.elevator_door_min_points_bin,
+    d.elevator_door_min_points_bin);
+  take("elevator_door_min_valid_bins", params_.elevator_door_min_valid_bins,
+    d.elevator_door_min_valid_bins);
+  take("elevator_door_vote_frames", params_.elevator_door_vote_frames, d.elevator_door_vote_frames);
   take("wall_line_width", params_.wall_line_width, d.wall_line_width);
   take("wall_display_z", params_.wall_display_z, d.wall_display_z);
   take("wall_marker_lifetime", params_.wall_marker_lifetime, d.wall_marker_lifetime);
@@ -661,16 +1036,27 @@ void WallPlaneFilterNode::clearWallCachesOnTimeJump(const rclcpp::Time & stamp)
   lidar_wall_marker_pub_->publish(reset);
   if (depth_debug_pub_) {depth_debug_pub_->publish(reset);}
   if (lidar_debug_pub_) {lidar_debug_pub_->publish(reset);}
+  last_depth_wall_markers_ = visualization_msgs::msg::MarkerArray();
+  last_lidar_wall_markers_ = visualization_msgs::msg::MarkerArray();
   wall_plane_filter::msg::WallPlaneArray empty_planes;
   empty_planes.header = marker.header;
   depth_wall_plane_pub_->publish(empty_planes);
   lidar_wall_plane_pub_->publish(empty_planes);
+  last_depth_wall_planes_ = empty_planes;
+  last_lidar_wall_planes_ = empty_planes;
+  for (auto & pub : depth_cam_plane_pubs_) {
+    pub->publish(empty_planes);
+  }
   validated_depth_lines_.clear();
   validated_depth_stamp_ = rclcpp::Time(0, 0, RCL_ROS_TIME);
-  depth_tracks_.clear();
+  for (auto & tracker : depth_cam_tracks_) {
+    tracker.clear();
+  }
   lidar_tracks_.clear();
-  depth_grid_valid_ = false;
-  wall_data_dirty_ = false;
+  for (size_t i = 0; i < depth_grid_valid_.size(); ++i) {
+    depth_grid_valid_[i] = 0;
+    depth_grid_origins_[i] = Eigen::Vector2d::Zero();
+  }
   wall_path_stamp_ = reference;
 }
 
@@ -744,6 +1130,21 @@ void WallPlaneFilterNode::publishCloud(
     msg.width * msg.height, msg.data.size(), subs);
 }
 
+bool WallPlaneFilterNode::acceptStampOnce(int key, int64_t stamp_ns)
+{
+  std::lock_guard<std::mutex> lock(dedup_mutex_);
+  for (const auto & item : recent_stamps_) {
+    if (item.first == key && item.second == stamp_ns) {
+      return false;
+    }
+  }
+  recent_stamps_.emplace_back(key, stamp_ns);
+  while (recent_stamps_.size() > kDedupHistory) {
+    recent_stamps_.pop_front();
+  }
+  return true;
+}
+
 void WallPlaneFilterNode::cloudCallback(const sensor_msgs::msg::PointCloud2::ConstSharedPtr msg)
 {
   if (!msg) {
@@ -751,11 +1152,18 @@ void WallPlaneFilterNode::cloudCallback(const sensor_msgs::msg::PointCloud2::Con
   }
   const rclcpp::Time stamp(msg->header.stamp);
   clearWallCachesOnTimeJump(stamp);
-  if (params_.process_hz > 1e-3 && last_stamp_.nanoseconds() > 0) {
-    const double dt = (stamp - last_stamp_).seconds();
-    if (dt >= 0.0 && dt < 1.0 / params_.process_hz) {
-      return;
+  if (!acceptStampOnce(-1, stamp.nanoseconds())) {
+    return;
+  }
+  {
+    std::lock_guard<std::mutex> lock(stamp_mutex_);
+    if (params_.process_hz > 1e-3 && last_stamp_.nanoseconds() > 0) {
+      const double dt = (stamp - last_stamp_).seconds();
+      if (dt >= 0.0 && dt < 1.0 / params_.process_hz) {
+        return;
+      }
     }
+    last_stamp_ = stamp;
   }
 
   CloudT cloud;
@@ -784,7 +1192,30 @@ void WallPlaneFilterNode::cloudCallback(const sensor_msgs::msg::PointCloud2::Con
   const size_t denoised_n = filtered.size();
   voxelDownsample(filtered);
   const size_t deviate_n = deviate.size();
-  last_stamp_ = cloud_stamp;
+
+  // Cull/project using previously confirmed lidar walls (map → target_frame).
+  {
+    std::vector<WallLine> map_walls;
+    {
+      std::lock_guard<std::mutex> lock(depth_wall_mutex_);
+      map_walls = lidar_tracks_.confirmed();
+    }
+    if (!map_walls.empty()) {
+      const std::string map_frame = wallWorkFrame();
+      Eigen::Isometry3d to_target = Eigen::Isometry3d::Identity();
+      if (lookupIso(params_.target_frame, map_frame, cloud_stamp, to_target)) {
+        const std::vector<WallLine> walls_base = transformLines(map_walls, to_target);
+        const Eigen::Vector2d sensor_xy = origin.head<2>();
+        cullWallBand(
+          filtered, deviate, walls_base,
+          params_.depth_wall_band_m, params_.depth_wall_band_outer_m,
+          params_.depth_wall_project, Eigen::Vector2d::Zero(),
+          params_.depth_wall_noise_k, params_.depth_wall_noise_max, nullptr, &sensor_xy,
+          &params_);
+      }
+    }
+  }
+
   // Display clouds go out immediately; wall tracking does not gate them.
   publishLidarCloud(filtered, deviate, cloud_stamp);
 
@@ -814,10 +1245,13 @@ void WallPlaneFilterNode::cloudCallback(const sensor_msgs::msg::PointCloud2::Con
     std::vector<WallLine> tracked;
     {
       std::lock_guard<std::mutex> lock(depth_wall_mutex_);
-      tracked = lidar_tracks_.update(map_obs, cloud_stamp.seconds(), trackConfigFrom(params_.lidar_hough));
+      tracked = lidar_tracks_.update(
+        map_obs, cloud_stamp.seconds(), trackConfigFrom(params_.lidar_hough, params_.wall_track));
     }
     publishTrackedMarkers(tracked, map_corners, cloud_stamp, map_frame, false);
   }
+
+  updateElevatorDoor(filtered, cloud_stamp);
 
   RCLCPP_INFO_THROTTLE(
     get_logger(), *get_clock(), 2000,
@@ -833,18 +1267,25 @@ void WallPlaneFilterNode::depthCallback(
   }
   const rclcpp::Time stamp(msg->header.stamp);
   clearWallCachesOnTimeJump(stamp);
+  if (!acceptStampOnce(static_cast<int>(idx), stamp.nanoseconds())) {
+    return;
+  }
   const bool find_walls = depth_find_walls_[idx] != 0;
   const std::string world = wallWorkFrame();
   // A zero stamp cannot be looked up. Use the latest TF only in that case.
   const rclcpp::Time lookup_stamp = stamp.nanoseconds() == 0 ?
     rclcpp::Time(0, 0, get_clock()->get_clock_type()) : stamp;
 
-  ++depth_tf_total_[idx];
+  {
+    std::lock_guard<std::mutex> lock(depth_tf_mutex_);
+    ++depth_tf_total_[idx];
+  }
   Eigen::Isometry3d T_bc = Eigen::Isometry3d::Identity();
   Eigen::Isometry3d T_wb = Eigen::Isometry3d::Identity();
   const bool base_ok = lookupIso(params_.target_frame, msg->header.frame_id, lookup_stamp, T_bc);
   const bool map_ok = base_ok && lookupIso(world, params_.target_frame, lookup_stamp, T_wb);
   if (!map_ok) {
+    std::lock_guard<std::mutex> lock(depth_tf_mutex_);
     ++depth_tf_fail_[idx];
   }
   reportDepthTf();
@@ -890,6 +1331,12 @@ void WallPlaneFilterNode::depthCallback(
     filtered = std::move(voxel);
   }
   finishCloud(filtered);
+  // Door ROI is defined in target_frame (base_link); filtered is already there.
+  if (depth_cam_names_[idx].find("front") != std::string::npos ||
+    depth_cam_names_[idx] == "camera1")
+  {
+    updateElevatorDoor(filtered, stamp);
+  }
   RCLCPP_INFO_THROTTLE(
     get_logger(), *get_clock(), 2000,
     "depth preprocess camera=%s input=%zu fly=%zu image=%zu roi=%zu voxel=%zu "
@@ -911,64 +1358,54 @@ void WallPlaneFilterNode::depthCallback(
       toMsg(deviate, stamp, params_.target_frame), "depth_deviate");
     return;
   }
-  if (!find_walls) {
-    DepthSlot slot;
-    transformInto(filtered, T_wb, slot.filtered_world);
-    transformInto(deviate, T_wb, slot.deviate_world);
-    slot.robot_xy = T_wb.translation().head<2>();
-    slot.stamp = stamp;
-    slot.ready_steady = std::chrono::steady_clock::now();
-    slot.fresh = true;
-    publishDepthCloud(idx, slot);
-    std::lock_guard<std::mutex> lock(depth_wall_mutex_);
-    depth_slots_[idx] = std::move(slot);
-    wall_data_dirty_ = true;
-    return;
-  }
-
-  // Wall-finding subset: above the floor, near, and within trusted depth noise.
-  const double floor_cut = params_.depth_ground_ref_z + params_.depth_wall_ground_margin;
-  const Eigen::Vector3d cam_b = T_bc.translation();
-  const double noise_k = std::max(0.0, params_.depth_wall_noise_k);
-  CloudT evidence;
-  if (params_.depth_voxel_leaf > publish_leaf + 1e-4) {
-    voxelLeaf(filtered, params_.depth_voxel_leaf, evidence);
-  } else {
-    evidence = filtered;
-  }
-  CloudT wall_base;
-  wall_base.reserve(evidence.size());
-  for (const auto & p : evidence.points) {
-    if (p.z < std::max(floor_cut, params_.depth_hough.z_min) ||
-      p.z > params_.depth_hough.z_max || std::hypot(p.x, p.y) > params_.depth_wall_range_max) {
-      continue;
-    }
-    const double d = (Eigen::Vector3d(p.x, p.y, p.z) - cam_b).norm();
-    if (noise_k * d * d > params_.depth_wall_noise_max) {
-      continue;
-    }
-    wall_base.push_back(p);
-  }
-  finishCloud(wall_base);
-  RCLCPP_INFO_THROTTLE(
-    get_logger(), *get_clock(), 2000,
-    "depth wall subset camera=%s voxel=%zu eligible=%zu floor_cut=%.2f range=%.2f",
-    depth_cam_names_[idx].c_str(), evidence.size(), wall_base.size(), floor_cut,
-    params_.depth_wall_range_max);
-
   DepthSlot slot;
-  transformInto(wall_base, T_wb, slot.wall_world);
   transformInto(filtered, T_wb, slot.filtered_world);
   transformInto(deviate, T_wb, slot.deviate_world);
-  slot.origin_world = T_wb * cam_b;
   slot.robot_xy = T_wb.translation().head<2>();
+  slot.sensor_xy = (T_wb * T_bc).translation().head<2>();
   slot.stamp = stamp;
-  slot.ready_steady = std::chrono::steady_clock::now();
-  slot.fresh = true;
+
+  // Publish first with cached walls (latency), then update Hough tracks.
   publishDepthCloud(idx, slot);
+
+  if (find_walls) {
+    // Wall-finding subset: above the floor, near, and within trusted depth noise.
+    const double floor_cut = params_.depth_ground_ref_z + params_.depth_wall_ground_margin;
+    const Eigen::Vector3d cam_b = T_bc.translation();
+    const double noise_k = std::max(0.0, params_.depth_wall_noise_k);
+    CloudT evidence;
+    if (params_.depth_voxel_leaf > publish_leaf + 1e-4) {
+      voxelLeaf(filtered, params_.depth_voxel_leaf, evidence);
+    } else {
+      evidence = filtered;
+    }
+    CloudT wall_base;
+    wall_base.reserve(evidence.size());
+    for (const auto & p : evidence.points) {
+      if (p.z < std::max(floor_cut, params_.depth_hough.z_min) ||
+        p.z > params_.depth_hough.z_max || std::hypot(p.x, p.y) > params_.depth_wall_range_max)
+      {
+        continue;
+      }
+      const double d = (Eigen::Vector3d(p.x, p.y, p.z) - cam_b).norm();
+      if (noise_k * d * d > params_.depth_wall_noise_max) {
+        continue;
+      }
+      wall_base.push_back(p);
+    }
+    finishCloud(wall_base);
+    RCLCPP_INFO_THROTTLE(
+      get_logger(), *get_clock(), 2000,
+      "depth wall subset camera=%s voxel=%zu eligible=%zu floor_cut=%.2f range=%.2f",
+      depth_cam_names_[idx].c_str(), evidence.size(), wall_base.size(), floor_cut,
+      params_.depth_wall_range_max);
+    CloudT wall_world;
+    transformInto(wall_base, T_wb, wall_world);
+    processDepthWalls(idx, wall_world, slot.robot_xy, stamp);
+  }
+
   std::lock_guard<std::mutex> lock(depth_wall_mutex_);
   depth_slots_[idx] = std::move(slot);
-  wall_data_dirty_ = true;
 }
 
 void WallPlaneFilterNode::publishLidarCloud(
@@ -992,23 +1429,56 @@ void WallPlaneFilterNode::publishLidarCloud(
 
 void WallPlaneFilterNode::publishDepthCloud(size_t idx, const DepthSlot & slot)
 {
-  std::vector<std::vector<Eigen::Vector2d>> wall_polys;
+  std::vector<WallLine> walls;
   {
     std::lock_guard<std::mutex> lock(depth_wall_mutex_);
-    // validated_depth_lines_ are the smoothed map tracks, including this fusion tick.
-    if (validated_depth_stamp_.nanoseconds() != 0 &&
-      std::abs((slot.stamp - validated_depth_stamp_).seconds()) <= params_.depth_merge_max_age)
-    {
-      for (const WallLine & line : validated_depth_lines_) {
-        wall_polys.push_back({line.a, line.b});
+    const bool stamp_ok = validated_depth_stamp_.nanoseconds() != 0 &&
+      std::abs((slot.stamp - validated_depth_stamp_).seconds()) <=
+      std::max(params_.depth_merge_max_age, 0.5);
+    if (idx < depth_cam_tracks_.size()) {
+      walls = depth_cam_tracks_[idx].confirmed();
+    }
+    if (params_.depth_cull_use_global_walls) {
+      if (stamp_ok && !validated_depth_lines_.empty()) {
+        walls = validated_depth_lines_;
+      }
+    } else if (walls.empty() && stamp_ok) {
+      // Prefer local tracks; fall back to strong global lines only.
+      for (const auto & line : validated_depth_lines_) {
+        if (static_cast<int>(line.support_points) >= params_.wall_fuse_min_support_points) {
+          walls.push_back(line);
+        }
       }
     }
   }
   CloudT filtered = slot.filtered_world;
   CloudT deviate = slot.deviate_world;
-  cullWallBand(
-    filtered, deviate, wall_polys,
-    params_.depth_wall_band_m, params_.depth_wall_band_outer_m);
+  size_t band_drop = 0;
+  size_t band_proj = 0;
+  size_t flat_n = 0;
+  if (!walls.empty()) {
+    band_drop = cullWallBand(
+      filtered, deviate, walls,
+      params_.depth_wall_band_m, params_.depth_wall_band_outer_m,
+      params_.depth_wall_project, slot.robot_xy,
+      params_.depth_wall_noise_k, params_.depth_wall_noise_max, &band_proj,
+      &slot.sensor_xy, &params_);
+  } else if (params_.depth_local_flatten_enable) {
+    // No wall yet: PCA flatten only. Skip when walls exist — wall project is enough
+    // and full-cloud PCA (~5k radius searches) was starving depth Hough callbacks.
+    flat_n = flattenLocalPlanes(
+      filtered, params_.depth_local_flatten_radius,
+      params_.depth_local_flatten_min_neighbors, params_.depth_local_flatten_max_curvature,
+      params_.depth_local_flatten_max_points);
+  }
+  if (band_drop > 0 || band_proj > 0 || flat_n > 0) {
+    RCLCPP_INFO_THROTTLE(
+      get_logger(), *get_clock(), 2000,
+      "depth flatten camera=%s walls=%zu drop=%zu proj=%zu local_flat=%zu project=%s band=%.3f outer=%.3f",
+      depth_cam_names_[idx].c_str(), walls.size(), band_drop, band_proj, flat_n,
+      params_.depth_wall_project ? "on" : "off",
+      params_.depth_wall_band_m, params_.depth_wall_band_outer_m);
+  }
   const std::string world = wallWorkFrame();
   const std::string out_frame = outputFrame();
   CloudT filtered_out;
@@ -1039,123 +1509,140 @@ void WallPlaneFilterNode::publishDepthCloud(size_t idx, const DepthSlot & slot)
 
 void WallPlaneFilterNode::reportDepthTf()
 {
-  const auto now = std::chrono::steady_clock::now();
-  const double period = std::max(0.5, params_.depth_wall_tf_report_sec);
-  if (std::chrono::duration<double>(now - depth_tf_report_last_).count() < period) {
-    return;
-  }
-  depth_tf_report_last_ = now;
   std::ostringstream ss;
   bool any = false;
-  for (size_t i = 0; i < depth_tf_total_.size(); ++i) {
-    if (depth_tf_total_[i] == 0) {
-      continue;
+  {
+    std::lock_guard<std::mutex> lock(depth_tf_mutex_);
+    const auto now = std::chrono::steady_clock::now();
+    const double period = std::max(0.5, params_.depth_wall_tf_report_sec);
+    if (std::chrono::duration<double>(now - depth_tf_report_last_).count() < period) {
+      return;
     }
-    any = true;
-    ss << ' ' << depth_cam_names_[i] << '=' << depth_tf_fail_[i] << '/' << depth_tf_total_[i] <<
-      " (" << std::fixed << std::setprecision(1) <<
-      100.0 * static_cast<double>(depth_tf_fail_[i]) / static_cast<double>(depth_tf_total_[i]) <<
-      "%)";
-    depth_tf_total_[i] = 0;
-    depth_tf_fail_[i] = 0;
+    depth_tf_report_last_ = now;
+    for (size_t i = 0; i < depth_tf_total_.size(); ++i) {
+      if (depth_tf_total_[i] == 0) {
+        continue;
+      }
+      any = true;
+      ss << ' ' << depth_cam_names_[i] << '=' << depth_tf_fail_[i] << '/' << depth_tf_total_[i] <<
+        " (" << std::fixed << std::setprecision(1) <<
+        100.0 * static_cast<double>(depth_tf_fail_[i]) /
+        static_cast<double>(depth_tf_total_[i]) << "%)";
+      depth_tf_total_[i] = 0;
+      depth_tf_fail_[i] = 0;
+    }
   }
   if (any) {
     RCLCPP_INFO(get_logger(), "depth TF fail rate:%s", ss.str().c_str());
   }
 }
 
-void WallPlaneFilterNode::wallFuseTick()
+void WallPlaneFilterNode::processDepthWalls(
+  size_t idx, const CloudT & wall_world, const Eigen::Vector2d & robot_xy,
+  const rclcpp::Time & stamp)
 {
-  CloudT walls;
-  Eigen::Vector2d center = Eigen::Vector2d::Zero();
-  rclcpp::Time stamp(0, 0, RCL_ROS_TIME);
-  bool depth_update = false;
+  if (idx >= depth_cam_tracks_.size()) {
+    return;
+  }
+  HoughConfig hough_cfg = params_.depth_hough;
   {
     std::lock_guard<std::mutex> lock(depth_wall_mutex_);
-    if (!wall_data_dirty_) {return;}
-    const DepthSlot * newest = nullptr;
-    for (const auto & slot : depth_slots_) {
-      if (slot.fresh && (!newest || slot.stamp > newest->stamp)) {newest = &slot;}
-    }
-    if (newest) {
-      depth_update = true;
-      stamp = newest->stamp;
-      center = newest->robot_xy;
-      // A short synchronized snapshot, not a persistent map or extrapolated
-      // track. Every final segment must pass this snapshot's support mask.
-      for (auto & slot : depth_slots_) {
-        if (slot.stamp.nanoseconds() != 0 &&
-          std::abs((stamp - slot.stamp).seconds()) <= params_.depth_merge_max_age)
-        {
-          walls.insert(walls.end(), slot.wall_world.begin(), slot.wall_world.end());
-        }
-        slot.fresh = false;
+    holdDepthGrid(idx, robot_xy, hough_cfg);
+  }
+  const auto result = extractHoughWalls(wall_world, robot_xy, hough_cfg);
+  if (params_.depth_hough.debug) {
+    publishHoughDebug(result, stamp, wallWorkFrame(), true);
+  }
+
+  const WallTrackConfig track_cfg = trackConfigFrom(params_.depth_hough, params_.wall_track);
+  std::vector<WallLine> cam_tracked;
+  std::vector<WallLine> all_tracked;
+  {
+    std::lock_guard<std::mutex> lock(depth_wall_mutex_);
+    cam_tracked = depth_cam_tracks_[idx].update(result.lines, stamp.seconds(), track_cfg);
+    // Age sibling camera tracks so lost walls expire without waiting for fusion.
+    for (size_t i = 0; i < depth_cam_tracks_.size(); ++i) {
+      if (i == idx) {
+        continue;
       }
+      depth_cam_tracks_[i].update({}, stamp.seconds(), track_cfg);
     }
-    wall_data_dirty_ = false;
+    all_tracked = collectDepthTrackedLines(stamp.seconds());
+    validated_depth_lines_ = all_tracked;
+    validated_depth_stamp_ = stamp;
   }
-  // Filtered clouds already went out in each sensor callback. This tick only
-  // finds depth walls and refreshes depth band culling for display.
-  if (depth_update) {
-    HoughConfig hough_cfg = params_.depth_hough;
-    {
-      std::lock_guard<std::mutex> lock(depth_wall_mutex_);
-      holdDepthGrid(center, hough_cfg);
-    }
-    const auto result = extractHoughWalls(walls, center, hough_cfg);
-    std::vector<WallLine> tracked;
-    {
-      std::lock_guard<std::mutex> lock(depth_wall_mutex_);
-      tracked = depth_tracks_.update(result.lines, stamp.seconds(), trackConfigFrom(params_.depth_hough));
-      // Band culling reads these tracked map lines, not the raw Hough.
-      validated_depth_lines_ = tracked;
-      validated_depth_stamp_ = stamp;
-    }
-    if (params_.depth_hough.debug) {
-      publishHoughDebug(result, stamp, wallWorkFrame(), true);
-    }
-    publishTrackedMarkers(tracked, result.corners, stamp, wallWorkFrame(), true);
-    republishDepthClouds();
-  }
+
+  publishDepthCamPlanes(idx, cam_tracked, stamp, wallWorkFrame());
+  publishTrackedMarkers(all_tracked, result.corners, stamp, wallWorkFrame(), true);
 }
 
-void WallPlaneFilterNode::holdDepthGrid(const Eigen::Vector2d & robot, HoughConfig & config)
+std::vector<WallLine> WallPlaneFilterNode::collectDepthTrackedLines(double /*stamp_sec*/)
+{
+  std::vector<WallLine> all;
+  for (const auto & tracker : depth_cam_tracks_) {
+    const auto lines = tracker.confirmed();
+    all.insert(all.end(), lines.begin(), lines.end());
+  }
+  return fuseWallLines(
+    all, params_.depth_hough.merge_angle_deg, params_.depth_hough.merge_distance,
+    params_.depth_hough.merge_gap, params_.wall_fuse_min_support_points);
+}
+
+void WallPlaneFilterNode::publishDepthCamPlanes(
+  size_t idx, const std::vector<WallLine> & lines, const rclcpp::Time & stamp,
+  const std::string & frame)
+{
+  if (idx >= depth_cam_plane_pubs_.size()) {
+    return;
+  }
+  const std::string output = outputFrame();
+  wall_plane_filter::msg::WallPlaneArray planes;
+  planes.header.frame_id = output;
+  planes.header.stamp = stamp;
+  Eigen::Isometry3d transform = Eigen::Isometry3d::Identity();
+  if (!(output == frame || lookupIso(output, frame, stamp, transform))) {
+    depth_cam_plane_pubs_[idx]->publish(planes);
+    return;
+  }
+  for (const auto & line_in : lines) {
+    WallLine line = line_in;
+    if (output != frame) {
+      line = transformLine(line_in, transform);
+    }
+    planes.planes.push_back(
+      toWallPlaneMsg(line, true, params_.depth_hough.z_min, params_.depth_hough.z_max));
+  }
+  depth_cam_plane_pubs_[idx]->publish(planes);
+}
+
+void WallPlaneFilterNode::holdDepthGrid(
+  size_t idx, const Eigen::Vector2d & robot, HoughConfig & config)
 {
   if (!params_.depth_hough.follow_sensor) {
     return;
   }
+  if (idx >= depth_grid_origins_.size()) {
+    return;
+  }
+  auto & origin = depth_grid_origins_[idx];
+  char & valid = depth_grid_valid_[idx];
   const double res = config.resolution;
   const int side = static_cast<int>(std::ceil(2.0 * config.half_extent / res));
   const double span = side * res;
   const double margin = std::max(0.5, 2.0 * res);
-  const bool inside = depth_grid_valid_ &&
-    robot.x() > depth_grid_origin_.x() + margin &&
-    robot.y() > depth_grid_origin_.y() + margin &&
-    robot.x() < depth_grid_origin_.x() + span - margin &&
-    robot.y() < depth_grid_origin_.y() + span - margin;
+  const bool inside = valid != 0 &&
+    robot.x() > origin.x() + margin &&
+    robot.y() > origin.y() + margin &&
+    robot.x() < origin.x() + span - margin &&
+    robot.y() < origin.y() + span - margin;
   if (!inside) {
-    depth_grid_origin_ = (robot / res).array().floor().matrix() * res -
+    origin = (robot / res).array().floor().matrix() * res -
       Eigen::Vector2d::Constant(span * 0.5);
-    depth_grid_valid_ = true;
+    valid = 1;
   }
   config.follow_sensor = false;
-  config.origin_x = depth_grid_origin_.x();
-  config.origin_y = depth_grid_origin_.y();
-}
-
-void WallPlaneFilterNode::republishDepthClouds()
-{
-  std::vector<DepthSlot> slots;
-  {
-    std::lock_guard<std::mutex> lock(depth_wall_mutex_);
-    slots = depth_slots_;
-  }
-  for (size_t i = 0; i < slots.size(); ++i) {
-    if (slots[i].stamp.nanoseconds() == 0) {
-      continue;
-    }
-    publishDepthCloud(i, slots[i]);
-  }
+  config.origin_x = origin.x();
+  config.origin_y = origin.y();
 }
 
 wall_plane_filter::msg::WallPlane WallPlaneFilterNode::toWallPlaneMsg(
@@ -1194,6 +1681,122 @@ wall_plane_filter::msg::WallPlane WallPlaneFilterNode::toWallPlaneMsg(
   return msg;
 }
 
+void WallPlaneFilterNode::updateElevatorDoor(const CloudT & cloud_base, const rclcpp::Time & stamp)
+{
+  if (!params_.elevator_door_enable || !elevator_door_pub_) {
+    return;
+  }
+  using Status = wall_plane_filter::msg::ElevatorDoorStatus;
+  Status msg;
+  msg.header.stamp = stamp;
+  msg.header.frame_id = params_.target_frame;
+  msg.state = Status::UNKNOWN;
+  msg.gap_m = 0.0;
+  msg.door_range_m = std::numeric_limits<double>::quiet_NaN();
+  msg.open_ratio = 0.0;
+  msg.confidence = 0.0;
+  msg.valid_bins = 0;
+  msg.open_bins = 0;
+  msg.near_bins = 0;
+
+  const int bins = std::max(3, params_.elevator_door_bins);
+  const double half_w = std::max(0.1, params_.elevator_door_half_width);
+  const double x_min = params_.elevator_door_x_min;
+  const double x_max = std::max(x_min + 0.1, params_.elevator_door_x_max);
+  const double z_min = params_.elevator_door_z_min;
+  const double z_max = params_.elevator_door_z_max;
+  const double bin_w = (2.0 * half_w) / static_cast<double>(bins);
+
+  std::vector<std::vector<double>> xs(static_cast<size_t>(bins));
+  for (const auto & p : cloud_base.points) {
+    if (p.x < x_min || p.x > x_max || p.z < z_min || p.z > z_max) {
+      continue;
+    }
+    if (std::abs(p.y) > half_w) {
+      continue;
+    }
+    int b = static_cast<int>(std::floor((p.y + half_w) / bin_w));
+    b = std::clamp(b, 0, bins - 1);
+    xs[static_cast<size_t>(b)].push_back(p.x);
+  }
+
+  std::vector<double> med(static_cast<size_t>(bins), std::numeric_limits<double>::quiet_NaN());
+  uint32_t valid = 0;
+  for (int i = 0; i < bins; ++i) {
+    auto & v = xs[static_cast<size_t>(i)];
+    if (static_cast<int>(v.size()) < params_.elevator_door_min_points_bin) {
+      continue;
+    }
+    const size_t mid = v.size() / 2;
+    std::nth_element(v.begin(), v.begin() + static_cast<std::ptrdiff_t>(mid), v.end());
+    med[static_cast<size_t>(i)] = v[mid];
+    ++valid;
+  }
+  msg.valid_bins = valid;
+  if (static_cast<int>(valid) < params_.elevator_door_min_valid_bins) {
+    std::lock_guard<std::mutex> lock(elevator_door_mutex_);
+    msg.state = elevator_door_state_;
+    elevator_door_pub_->publish(msg);
+    return;
+  }
+
+  // Near plane ≈ lower quartile of valid bin medians (door panel / sill distance).
+  std::vector<double> near_candidates;
+  near_candidates.reserve(valid);
+  for (double m : med) {
+    if (std::isfinite(m)) {
+      near_candidates.push_back(m);
+    }
+  }
+  std::sort(near_candidates.begin(), near_candidates.end());
+  const double near_x = near_candidates[near_candidates.size() / 4];
+  msg.door_range_m = near_x;
+  const double open_x = near_x + std::max(0.1, params_.elevator_door_open_margin);
+
+  uint32_t open_bins = 0;
+  uint32_t near_bins = 0;
+  double gap_sum = 0.0;
+  for (double m : med) {
+    if (!std::isfinite(m)) {
+      continue;
+    }
+    if (m >= open_x) {
+      ++open_bins;
+      gap_sum += (m - near_x);
+    } else {
+      ++near_bins;
+    }
+  }
+  msg.open_bins = open_bins;
+  msg.near_bins = near_bins;
+  msg.open_ratio = static_cast<double>(open_bins) / static_cast<double>(valid);
+  msg.gap_m = open_bins > 0 ? (gap_sum / static_cast<double>(open_bins)) : 0.0;
+  msg.confidence = std::min(1.0, static_cast<double>(valid) / static_cast<double>(bins));
+
+  const uint8_t measured = (msg.open_ratio >= params_.elevator_door_open_ratio) ?
+    Status::OPEN : Status::CLOSED;
+
+  {
+    std::lock_guard<std::mutex> lock(elevator_door_mutex_);
+    if (measured == elevator_door_pending_) {
+      ++elevator_door_pending_hits_;
+    } else {
+      elevator_door_pending_ = measured;
+      elevator_door_pending_hits_ = 1;
+    }
+    if (elevator_door_pending_hits_ >= std::max(1, params_.elevator_door_vote_frames)) {
+      elevator_door_state_ = elevator_door_pending_;
+    }
+    msg.state = elevator_door_state_;
+  }
+
+  elevator_door_pub_->publish(msg);
+  RCLCPP_INFO_THROTTLE(
+    get_logger(), *get_clock(), 1000,
+    "elevator door state=%u open_ratio=%.2f near_x=%.2f gap=%.2f valid=%u/%d",
+    static_cast<unsigned>(msg.state), msg.open_ratio, near_x, msg.gap_m, valid, bins);
+}
+
 void WallPlaneFilterNode::publishTrackedMarkers(
   const std::vector<WallLine> & lines, const std::vector<Eigen::Vector2d> & corners,
   const rclcpp::Time & stamp, const std::string & frame, bool depth)
@@ -1205,19 +1808,57 @@ void WallPlaneFilterNode::publishTrackedMarkers(
   const double fallback_z_min = depth ? params_.depth_hough.z_min : params_.lidar_hough.z_min;
   const double fallback_z_max = depth ? params_.depth_hough.z_max : params_.lidar_hough.z_max;
 
+  wall_plane_filter::msg::WallPlaneArray planes;
+  planes.header.frame_id = output;
+  planes.header.stamp = stamp;
+
+  // Empty observation: republish last markers with refreshed stamp/lifetime (coasting).
+  if (lines.empty()) {
+    visualization_msgs::msg::MarkerArray coast;
+    wall_plane_filter::msg::WallPlaneArray coast_planes;
+    bool have_coast = false;
+    {
+      std::lock_guard<std::mutex> lock(depth_wall_mutex_);
+      auto & last_markers = depth ? last_depth_wall_markers_ : last_lidar_wall_markers_;
+      auto & last_planes = depth ? last_depth_wall_planes_ : last_lidar_wall_planes_;
+      if (!last_markers.markers.empty()) {
+        coast = last_markers;
+        for (auto & m : coast.markers) {
+          m.header.stamp = stamp;
+          if (m.action == Marker::ADD) {
+            m.lifetime = rclcpp::Duration::from_seconds(params_.wall_marker_lifetime);
+          }
+        }
+        last_planes.header.stamp = stamp;
+        coast_planes = last_planes;
+        have_coast = true;
+      }
+    }
+    if (have_coast) {
+      marker_pub->publish(coast);
+      plane_pub->publish(coast_planes);
+      RCLCPP_INFO_THROTTLE(
+        get_logger(), *get_clock(), 2000,
+        "wall planes %s empty; coasting last markers=%zu",
+        depth ? "depth" : "lidar", coast.markers.size());
+    } else {
+      plane_pub->publish(planes);
+      RCLCPP_INFO_THROTTLE(
+        get_logger(), *get_clock(), 2000,
+        "wall planes %s empty; no previous markers to coast", depth ? "depth" : "lidar");
+    }
+    return;
+  }
+
   visualization_msgs::msg::MarkerArray final;
   Marker clear;
-  clear.header.frame_id = output;
-  clear.header.stamp = stamp;
+  clear.header = planes.header;
   clear.action = Marker::DELETEALL;
   final.markers.push_back(clear);
 
-  wall_plane_filter::msg::WallPlaneArray planes;
-  planes.header = clear.header;
-
   Eigen::Isometry3d transform = Eigen::Isometry3d::Identity();
   const bool tf_ok = output == frame || lookupIso(output, frame, stamp, transform);
-  if (tf_ok && !lines.empty()) {
+  if (tf_ok) {
     Marker edges;
     edges.header = clear.header;
     edges.ns = depth ? "depth_walls" : "lidar_walls";
@@ -1277,6 +1918,16 @@ void WallPlaneFilterNode::publishTrackedMarkers(
   }
   marker_pub->publish(final);
   plane_pub->publish(planes);
+  {
+    std::lock_guard<std::mutex> lock(depth_wall_mutex_);
+    if (depth) {
+      last_depth_wall_markers_ = final;
+      last_depth_wall_planes_ = planes;
+    } else {
+      last_lidar_wall_markers_ = final;
+      last_lidar_wall_planes_ = planes;
+    }
+  }
   RCLCPP_INFO_THROTTLE(
     get_logger(), *get_clock(), 2000,
     "wall planes %s published=%zu output_tf=%d",

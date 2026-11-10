@@ -65,7 +65,8 @@ wall_plane_filter:
     #   /wall_plane_filter/cloud_deviate    仅雷达剔除点
     #   /wall_plane_filter/depth_wall_markers
     #   /wall_plane_filter/lidar_wall_markers
-    #   /wall_plane_filter/depth_wall_planes   深度竖直墙面几何
+    #   /wall_plane_filter/camera{1,2,3,4}/wall_planes  各路深度立刻发布
+    #   /wall_plane_filter/depth_wall_planes   四路跟踪结果汇总
     #   /wall_plane_filter/lidar_wall_planes   雷达竖直墙面几何
     # 兼容旧配置。输入不论 reliable 还是 best-effort 都会收。
     # 过滤点云同时发 Reliable + Best Effort（本机 RViz 点云是 Reliable）。
@@ -79,23 +80,44 @@ wall_plane_filter:
     # base_link 下保留的水平距离（米）
     depth_range_min: 0.10
     depth_range_max: 4.0
-    # 有序深度图：与上下左右任一邻居的距离差超过 max(abs, rel*距离) 就丢掉
-    # 墙边的飞点会被削掉一圈。无序点云跳过这一步
+    # 有序深度图：与 8 邻域中至少 N 个邻居距离差超过 max(abs, rel*距离) 才标飞点
     depth_fly_enable: true
     depth_fly_abs_m: 0.04
     depth_fly_rel: 0.03
-    # 3×3 距离中值，窗口里有效像素少于此数则丢掉该像素。然后行列都按步长抽点
+    depth_fly_min_neighbors: 2      # 至少几个邻居超限才丢掉（1~8）
+    # (2*half+1)^2 距离中值；邻域 MAD>edge_mad 时不做中值缩放（保边）
     depth_median_enable: true
-    depth_median_min: 5
-    depth_decimate_stride: 2
+    depth_median_half: 2
+    depth_median_min: 8
+    depth_median_edge_mad: 0.03     # 米；边缘离散度超过则保留原深度
+    depth_decimate_stride: 2        # 降采样步长；采样起点为 stride/2
     # 找墙用的体素边长（米）。发布点云用更细的 depth_publish_voxel
     depth_voxel_leaf: 0.02
-    # 发布到 depth_cloud_filtered 的体素边长（米）。2 cm 才卡得住离墙 2 cm
+    # 发布到 depth_cloud_filtered 的体素边长（米）
     depth_publish_voxel: 0.02
-    # 点到已发布墙的水平距离落在 (band, outer]（米）就丢掉。
-    # 近于 band 的留在墙上，远于 outer 的当障碍物留下
-    depth_wall_band_m: 0.03
-    depth_wall_band_outer_m: 0.15
+    # 用法向距离 |n·xy-ρ|：有效 keep=max(band, min(noise_max,k·r²))，
+    # |d|≤keep 投影到墙面，(keep,outer] 当涂抹丢掉，更远当障碍物留下。
+    # 噪声距离用相机原点（非机器人）计算。
+    depth_wall_band_m: 0.07
+    depth_wall_band_outer_m: 0.20
+    # true：带内贴墙点投影到竖直墙面，使 filtered 点共面
+    depth_wall_project: true
+    # false=旧行为直接投影；true=投影前检查局部法向/曲率，避免压扁靠墙障碍物
+    wall_project_local_check: false
+    wall_project_radius: 0.15           # 米；局部 PCA 半径
+    wall_project_normal_deg: 25.0       # 度；局部法向与墙法向最大夹角
+    wall_project_max_curvature: 0.08    # 曲率上限
+    wall_project_min_neighbors: 6       # 邻域最少点数
+    # 尚无跟踪墙时对局部平面片做 PCA（有墙时只靠墙带投影）
+    depth_local_flatten_enable: true
+    depth_local_flatten_radius: 0.12
+    depth_local_flatten_min_neighbors: 10
+    depth_local_flatten_max_curvature: 0.08
+    depth_local_flatten_max_points: 2000  # PCA 点数上限，防止拖死回调
+    # 跨相机墙合并：支撑点数低于该值的线不输出
+    wall_fuse_min_support_points: 10
+    # true：cull 用全局融合墙（现网）；false：优先本相机 track
+    depth_cull_use_global_walls: true
     # 半径离群点剔除，在体素化之后做。半径内邻居少于此数的体素丢掉
     depth_radius_enable: true
     depth_radius_search: 0.08
@@ -104,8 +126,8 @@ wall_plane_filter:
     depth_wall_range_max: 3.0
     # 深度噪声约等于 k·d²（d 为到相机的距离，米）
     depth_wall_noise_k: 0.005
-    # 预测噪声超过该值（米）的点不参与找墙。0.005·3²=0.045
-    depth_wall_noise_max: 0.045
+    # 须 ≥ depth_wall_band_m，否则远距 keep 被 band 卡住；也作找墙噪声上限
+    depth_wall_noise_max: 0.08
     # base_link 下的地面高度（米）
     depth_ground_ref_z: 0.0
     # z < ref_z + 该值（米）的点不参与找墙
@@ -119,16 +141,40 @@ wall_plane_filter:
     # 各路点云和两套墙 Marker 的发布坐标系。base_link 表示用 target_frame
     depth_wall_output_frame: map
 
-    # 深度快照处理频率（Hz）；雷达由 process_hz 限频。必须在 (0, 30]。
+    # 兼容旧配置。深度找墙已改为每路相机回调内独立 Hough+跟踪，不再走融合定时器。
     depth_wall_fuse_hz: 10.0
-    # 跨相机快照最大时间差（秒），所有点先按各自 stamp 变换到 map。
+    # 墙带抹点时，其它相机跟踪结果允许的最大时间差（秒）。
     depth_merge_max_age: 0.5
     # LINE_LIST 边线宽度；墙面高度用每条线支撑点的 z_min/z_max（缺省回退 hough.z_*）。
     wall_line_width: 0.04
     # 仅拐角点 Marker 的显示高度（米）；墙面几何不再使用该值。
     wall_display_z: 0.10
-    # Marker 有效期（ROS 时间秒）；每个结果先 DELETEALL，空结果也清除旧线/旧面。
-    wall_marker_lifetime: 0.75
+    # Marker 寿命宜 ≥ lose_sec；空观测会重发上一帧并刷新 lifetime。
+    wall_marker_lifetime: 3.0
+
+    # 墙跟踪稳态（深度/雷达共用）。伸长立刻，缩短要 shorten_frames；丢检 coast lose_sec。
+    wall_track:
+      normal_gate: 0.15             # 米；关联法向缓冲
+      merge_gap: 0.25               # 米；沿线重叠允许间隙
+      obs_weight: 0.25              # 观测融合权重，越小越稳
+      confirm_frames: 1             # 先尽快出墙；稳了可改回 2~3
+      shorten_frames: 5             # 连续缩短才收端点
+      lose_sec: 2.0                 # 秒；确认墙丢失后继续保持
+
+    # 电梯门开闭（target_frame/base_link 前方 ROI）。话题 /wall_plane_filter/elevator_door_status
+    # state: 0=UNKNOWN 1=OPEN 2=CLOSED。雷达每帧 + 前视深度参与投票。
+    elevator_door_enable: true
+    elevator_door_x_min: 0.40       # 米；门 ROI 近端
+    elevator_door_x_max: 2.50       # 米；门 ROI 远端
+    elevator_door_half_width: 0.55  # 米；门半宽（总宽约 1.1 m）
+    elevator_door_z_min: 0.20
+    elevator_door_z_max: 1.40
+    elevator_door_open_margin: 0.35 # 米；比近平面更远超过该值算缺口
+    elevator_door_open_ratio: 0.45  # 缺口柱占比 ≥ 此值判开
+    elevator_door_bins: 11
+    elevator_door_min_points_bin: 3
+    elevator_door_min_valid_bins: 4
+    elevator_door_vote_frames: 4    # 连续同结论才切换状态
 
     # 两种传感器共享提取器，分别配置；只在各自原始二值图上验证。
     depth_hough:
@@ -143,19 +189,19 @@ wall_plane_filter:
       z_min: 0.05                   # 米；投影前在 target_frame 下筛选高度
       z_max: 1.50                   # 米；按实际地板/天花板高度调整
       theta_deg: 1.0                # 度；Hough角度分辨率
-      votes: 10                    # 票；Hough阈值
-      min_line_length: 0.50         # 米；Hough和最终墙线的最短长度
+      votes: 6                     # 票；Hough峰值（略放宽便于出墙）
+      min_line_length: 0.40         # 米；Hough和最终墙线的最短长度
       hough_max_gap: 0.15           # 米；Hough检测允许连接的像素间隙
       merge_angle_deg: 5.0          # 度；重复线段方向误差
       merge_distance: 0.06         # 米；重复线段法向距离
       merge_gap: 0.15              # 米；重复线段沿线最大间隙
       parallel_angle_deg: 10.0      # 度；夹角小于此值不求交点
       intersection_extension: 0.20  # 米；交点最多超出每条线的端点距离
-      support_band: 0.08            # 米；支撑邻域半宽，>=0.71*resolution，<=10格
-      min_support_ratio: 0.70       # 0~1；原始二值图占据支撑比例
-      max_unsupported_gap: 0.18     # 米；连续无支撑超过此值必须拆开
-      min_continuous_support: 0.15  # 米；至少有这么长的连续占据支撑
-      min_support_points: 10        # 点；最终线段附近真实三维点数
+      support_band: 0.10            # 米；支撑邻域半宽，>=0.71*resolution，<=10格
+      min_support_ratio: 0.55       # 0~1；原始二值图占据支撑比例
+      max_unsupported_gap: 0.25     # 米；连续无支撑超过此值必须拆开
+      min_continuous_support: 0.10  # 米；至少有这么长的连续占据支撑
+      min_support_points: 6         # 点；最终线段附近真实三维点数
       max_lines: 80                 # 条；Hough候选上限，限制求交开销（最多256）
       refine: true                 # 原始支撑点TLS精修，精修后再次验证
       debug: false                 # 发布 binary OccupancyGrid + debug_markers
