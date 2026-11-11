@@ -90,8 +90,44 @@ Visualization Manager:
     Queue Size: 5
     Decay Time: 0
   - Class: rviz_default_plugins/MarkerArray
-    Name: depth walls (all cams)
+    Name: camera1 walls
     Enabled: true
+    Marker Topic:
+      Value: /wall_plane_filter/camera1/wall_markers
+      Reliability Policy: Reliable
+      Durability Policy: Volatile
+      Depth: 1
+    Queue Size: 10
+  - Class: rviz_default_plugins/MarkerArray
+    Name: camera2 walls
+    Enabled: true
+    Marker Topic:
+      Value: /wall_plane_filter/camera2/wall_markers
+      Reliability Policy: Reliable
+      Durability Policy: Volatile
+      Depth: 1
+    Queue Size: 10
+  - Class: rviz_default_plugins/MarkerArray
+    Name: camera3 walls
+    Enabled: true
+    Marker Topic:
+      Value: /wall_plane_filter/camera3/wall_markers
+      Reliability Policy: Reliable
+      Durability Policy: Volatile
+      Depth: 1
+    Queue Size: 10
+  - Class: rviz_default_plugins/MarkerArray
+    Name: camera4 walls
+    Enabled: true
+    Marker Topic:
+      Value: /wall_plane_filter/camera4/wall_markers
+      Reliability Policy: Reliable
+      Durability Policy: Volatile
+      Depth: 1
+    Queue Size: 10
+  - Class: rviz_default_plugins/MarkerArray
+    Name: depth walls (fused)
+    Enabled: false
     Marker Topic:
       Value: /wall_plane_filter/depth_wall_markers
       Reliability Policy: Reliable

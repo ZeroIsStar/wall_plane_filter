@@ -15,7 +15,6 @@ if(CMAKE_COMPILER_IS_GNUCXX OR CMAKE_CXX_COMPILER_ID MATCHES "Clang")
   add_compile_options($<$<CONFIG:RelWithDebInfo>:-O2>)
 endif()
 
-# Avoid PCL visualization → VTK → MPI (same as yolo_trackers).
 find_package(ament_cmake REQUIRED)
 find_package(rclcpp REQUIRED)
 find_package(sensor_msgs REQUIRED)
@@ -24,14 +23,13 @@ find_package(visualization_msgs REQUIRED)
 find_package(std_msgs REQUIRED)
 find_package(nav_msgs REQUIRED)
 find_package(rosidl_default_generators REQUIRED)
-find_package(OpenCV REQUIRED COMPONENTS core imgproc HINTS /opt/opencv_lib/lib/cmake/opencv4)
 find_package(tf2 REQUIRED)
 find_package(tf2_ros REQUIRED)
 find_package(tf2_eigen REQUIRED)
 find_package(tf2_geometry_msgs REQUIRED)
 find_package(Eigen3 REQUIRED)
 find_package(pcl_conversions REQUIRED)
-# Honor PCL_ROOT (/opt/pcl_lib) instead of ignoring it under the old policy.
+find_package(OpenCV REQUIRED COMPONENTS core imgproc)
 if(POLICY CMP0074)
   cmake_policy(SET CMP0074 NEW)
 endif()
@@ -46,9 +44,9 @@ rosidl_generate_interfaces(${PROJECT_NAME}
 
 include_directories(
   include
-  ${OpenCV_INCLUDE_DIRS}
   ${EIGEN3_INCLUDE_DIRS}
   ${PCL_INCLUDE_DIRS}
+  ${OpenCV_INCLUDE_DIRS}
 )
 link_directories(${PCL_LIBRARY_DIRS})
 add_definitions(${PCL_DEFINITIONS})
@@ -57,7 +55,6 @@ add_library(${PROJECT_NAME}_lib SHARED
   src/wall_plane_filter_node.cpp
   src/wall_hough.cpp
   src/wall_track.cpp
-  src/lidar_tail_filter.cpp
 )
 
 ament_target_dependencies(${PROJECT_NAME}_lib
@@ -75,12 +72,16 @@ ament_target_dependencies(${PROJECT_NAME}_lib
 )
 
 rosidl_get_typesupport_target(cpp_typesupport_target ${PROJECT_NAME} "rosidl_typesupport_cpp")
-target_link_libraries(${PROJECT_NAME}_lib ${PCL_LIBRARIES} ${OpenCV_LIBRARIES} "${cpp_typesupport_target}")
+target_link_libraries(${PROJECT_NAME}_lib
+  ${PCL_LIBRARIES}
+  ${OpenCV_LIBS}
+  "${cpp_typesupport_target}")
 
 target_include_directories(${PROJECT_NAME}_lib PUBLIC
   $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/include>
   $<INSTALL_INTERFACE:include>
   ${PCL_INCLUDE_DIRS}
+  ${OpenCV_INCLUDE_DIRS}
 )
 
 add_executable(${PROJECT_NAME}_node src/main.cpp)

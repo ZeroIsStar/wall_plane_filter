@@ -18,7 +18,6 @@
   <depend>visualization_msgs</depend>
   <depend>std_msgs</depend>
   <depend>nav_msgs</depend>
-  <depend>libopencv-dev</depend>
   <depend>tf2</depend>
   <depend>tf2_ros</depend>
   <depend>tf2_eigen</depend>
@@ -26,6 +25,7 @@
   <depend>eigen</depend>
   <depend>pcl_conversions</depend>
   <depend>libpcl-all-dev</depend>
+  <depend>libopencv-dev</depend>
   <exec_depend>launch_ros</exec_depend>
   <exec_depend>rosidl_default_runtime</exec_depend>
   <member_of_group>rosidl_interface_packages</member_of_group>

@@ -1,236 +1,179 @@
 wall_plane_filter:
   ros__parameters:
-    # 使用 bag 的 /clock。回放时要加 --clock，暂停 bag 节点也会停
-    use_sim_time: true
+    # ========== 通用 / TF ==========
+    target_frame: base_link          # 机体系，雷达/深度 ROI 裁剪坐标系
+    tf_timeout: 0.25                 # TF 查询超时（秒）
+    wall_line_width: 0.04            # Marker 线宽（米）
+    wall_display_z: 0.10             # 显示用参考高度（米，部分可视化）
+    wall_marker_lifetime: 3.00       # Marker 生命周期（秒）
+    wall_marker_publish_hz: 20.0     # Marker 发布上限 Hz（≤0 表示每帧都发）
 
-    # 3D 雷达点云话题
-    cloud_topic: /vanjee/lidar
-    # 节点对雷达和深度都同时订阅 reliable 与 best-effort，只保留这个参数兼容旧配置。
-    lidar_sub_reliable: true
-    # 空字符串表示用点云 header.frame_id 作为雷达系（射线原点、z 裁剪轴）
-    lidar_frame: ""
-    # 雷达过滤和雷达墙拟合所在的机器人坐标系
-    target_frame: base_link
+    # ========== 雷达墙（ROI + 体素 → extract → WallTracker+KF）==========
+    # 订阅雷达点云；发布 /wall_plane_filter/lidar_wall_planes 与 lidar_wall_markers
+    # 水平距离统一 3m：ROI 与找墙输入一致
+    cloud_topic: /vanjee/lidar       # 雷达 PointCloud2 话题
+    lidar_wall_enable: true          # 是否做雷达找墙与 Marker
+    publish_cloud_filtered: false    # 是否发布 /wall_plane_filter/cloud_filtered（过滤后保留点）
+    z_min: 0.05                      # 雷达 ROI：最低高度（target_frame，米）
+    z_max: 1.80                      # 雷达 ROI：最高高度（米）
+    range_min: 0.20                  # 雷达 ROI：水平距离下限（米）
+    range_max: 3.0                   # 雷达 ROI：水平距离上限（米，与深度一致）
+    voxel_leaf: 0.05                 # 雷达各向同性体素边长（米）
+    lidar_wall_range_max: 3.0        # 找墙用水平距离上限（米，≤ range_max）
 
-    # 剔除雷达坐标系下、沿雷达 z 轴落在 [down, up]（米）内的点
-    lidar_z_cut_enable: true
-    lidar_z_cut_down: -0.15
-    lidar_z_cut_up: 0.15
-    # 上述高度带只作用于到雷达 z 轴的水平距离小于该值（米）的点。
-    # 更远的墙即使处在传感器高度也保留。
-    lidar_z_cut_range_max: 1.5
-    # 3D 雷达找墙开关。参数见 lidar_hough，Marker 发到输出坐标系
-    lidar_wall_enable: true
-    # 只对水平距离不超过该值（米）的雷达点做墙面拟合
-    lidar_wall_range_max: 3.0
-    # 按每一圈的距离轮廓去掉朝向雷达凸出的浅弓形（墙边毛刺）
-    wall_edge_enable: true
-    # 相对邻域距离凸出 edge_min～edge_max（米）才算弓形
-    edge_min: 0.04
-    edge_max: 0.45
-    # 估计这一圈“墙距离”时，左右各看这么多度
-    ring_bow_half_deg: 12.0
-    # 按俯仰角分圈的分辨率（度）
-    ap_el_res_deg: 1.0
-    # 弓形凸出超过该深度（米）视为真实障碍，保留不删
-    ap_keep_depth: 0.40
+    # ========== 拐角锁 / 墙面支撑夹紧（深度与雷达共用）==========
+    # corner_snap：非平行墙在端点附近求交，把靠近交点的端点吸附到交点（L 形锁齐）
+    # wall_clamp：墙段 a–b 与 z 硬夹紧到本帧找墙点云在 support_band 内的投影范围
+    corner_snap_enable: true         # 是否开启拐角端点吸附
+    corner_snap_dist: 0.0            # 吸附距离（米）；≤0 则用对应 hough.intersection_extension
+    wall_clamp_to_support: true      # 是否按支撑点云夹紧墙面几何
+    wall_extent_margin_m: 0.01       # 夹紧时相对支撑极值的余量（米）
 
-    # 去毛点之后的雷达点云体素边长（米）；≤0 表示不降采样
-    voxel_leaf: 0.02
-    # 雷达处理频率上限（Hz）；0 表示每帧都处理
-    process_hz: 10.0
-    # 雷达点在 base_link 下保留的高度（米）
-    z_min: 0.05
-    z_max: 1.80
-    # 雷达点在 base_link 下保留的水平距离（米）
-    range_min: 0.20
-    range_max: 12.0
-    # TF 查询超时（秒）。查询用点云自己的时间戳，要盖住 TF 周期，否则四路深度都会被丢掉
-    tf_timeout: 0.25
-
-    # ======================= 深度相机 =======================
-    # camera1 前 / camera2 左前 / camera4 右前 / camera3 后
-    # 深度去噪总开关。false 时不订阅深度话题
-    depth_clean_enable: true
-    # 四路深度点云话题
-    depth_topics:
+    # ========== 深度相机 ==========
+    depth_clean_enable: true         # 是否启用深度预处理与发布
+    depth_topics:                    # 深度点云订阅话题列表
       - /camera1/depth/points
       - /camera2/depth/points
       - /camera3/depth/points
       - /camera4/depth/points
-    # 发布（都在 depth_wall_output_frame，默认 map；处理完立刻发，不合并）：
-    #   /wall_plane_filter/camera{1,2,3,4}/depth_cloud_filtered  各路深度独立发布
-    #   /wall_plane_filter/camera{1,2,3,4}/depth_cloud_deviate   各路剔除点
-    #   /wall_plane_filter/cloud_filtered   仅雷达过滤点（雷达回调内发出）
-    #   /wall_plane_filter/cloud_deviate    仅雷达剔除点
-    #   /wall_plane_filter/depth_wall_markers
-    #   /wall_plane_filter/lidar_wall_markers
-    #   /wall_plane_filter/camera{1,2,3,4}/wall_planes  各路深度立刻发布
-    #   /wall_plane_filter/depth_wall_planes   四路跟踪结果汇总
-    #   /wall_plane_filter/lidar_wall_planes   雷达竖直墙面几何
-    # 兼容旧配置。输入不论 reliable 还是 best-effort 都会收。
-    # 过滤点云同时发 Reliable + Best Effort（本机 RViz 点云是 Reliable）。
-    # bag/节点/RViz 都要 CYCLONEDDS_URI=file:///workspace/dds_local.xml（勿用 /capella/dds.xml）。
-    depth_sub_reliable: true
+    depth_wall_cameras: ["camera1", "camera2", "camera3", "camera4"]  # 参与找墙的相机名
+    depth_wall_map_frame: map        # 墙跟踪/融合工作坐标系
+    depth_wall_output_frame: map     # 发布 wall_planes / markers / 点云的坐标系
 
-    # ---- 单帧预处理（每路相机回调内完成） ----
-    # base_link 下保留的高度（米）
-    depth_z_min: -0.05
-    depth_z_max: 1.50
-    # base_link 下保留的水平距离（米）
-    depth_range_min: 0.10
-    depth_range_max: 4.0
-    # 有序深度图：与 8 邻域中至少 N 个邻居距离差超过 max(abs, rel*距离) 才标飞点
-    depth_fly_enable: true
-    depth_fly_abs_m: 0.04
-    depth_fly_rel: 0.03
-    depth_fly_min_neighbors: 2      # 至少几个邻居超限才丢掉（1~8）
-    # (2*half+1)^2 距离中值；邻域 MAD>edge_mad 时不做中值缩放（保边）
-    depth_median_enable: true
-    depth_median_half: 2
-    depth_median_min: 8
-    depth_median_edge_mad: 0.03     # 米；边缘离散度超过则保留原深度
-    depth_decimate_stride: 2        # 降采样步长；采样起点为 stride/2
-    # 找墙用的体素边长（米）。发布点云用更细的 depth_publish_voxel
-    depth_voxel_leaf: 0.02
-    # 发布到 depth_cloud_filtered 的体素边长（米）
-    depth_publish_voxel: 0.02
-    # 用法向距离 |n·xy-ρ|：有效 keep=max(band, min(noise_max,k·r²))，
-    # |d|≤keep 投影到墙面，(keep,outer] 当涂抹丢掉，更远当障碍物留下。
-    # 噪声距离用相机原点（非机器人）计算。
-    depth_wall_band_m: 0.07
-    depth_wall_band_outer_m: 0.20
-    # true：带内贴墙点投影到竖直墙面，使 filtered 点共面
-    depth_wall_project: true
-    # false=旧行为直接投影；true=投影前检查局部法向/曲率，避免压扁靠墙障碍物
-    wall_project_local_check: false
-    wall_project_radius: 0.15           # 米；局部 PCA 半径
-    wall_project_normal_deg: 25.0       # 度；局部法向与墙法向最大夹角
-    wall_project_max_curvature: 0.08    # 曲率上限
-    wall_project_min_neighbors: 6       # 邻域最少点数
-    # 尚无跟踪墙时对局部平面片做 PCA（有墙时只靠墙带投影）
-    depth_local_flatten_enable: true
-    depth_local_flatten_radius: 0.12
-    depth_local_flatten_min_neighbors: 10
-    depth_local_flatten_max_curvature: 0.08
-    depth_local_flatten_max_points: 2000  # PCA 点数上限，防止拖死回调
-    # 跨相机墙合并：支撑点数低于该值的线不输出
-    wall_fuse_min_support_points: 10
-    # true：cull 用全局融合墙（现网）；false：优先本相机 track
-    depth_cull_use_global_walls: true
-    # 半径离群点剔除，在体素化之后做。半径内邻居少于此数的体素丢掉
-    depth_radius_enable: true
-    depth_radius_search: 0.08
-    depth_radius_min_neighbors: 4
-    # 找墙只用水平距离不超过该值（米）的点，更远的深度噪声太大
-    depth_wall_range_max: 3.0
-    # 深度噪声约等于 k·d²（d 为到相机的距离，米）
-    depth_wall_noise_k: 0.005
-    # 须 ≥ depth_wall_band_m，否则远距 keep 被 band 卡住；也作找墙噪声上限
-    depth_wall_noise_max: 0.08
-    # base_link 下的地面高度（米）
-    depth_ground_ref_z: 0.0
-    # z < ref_z + 该值（米）的点不参与找墙
-    depth_wall_ground_margin: 0.08
-    # 参与找墙的相机名，需与话题里的相机名一致
-    depth_wall_cameras: ["camera1", "camera2", "camera3", "camera4"]
-    # 每隔这么多秒打印一次各相机的 TF 失败率
-    depth_wall_tf_report_sec: 5.0
-    # 深度快照投影所在的坐标系
-    depth_wall_map_frame: map
-    # 各路点云和两套墙 Marker 的发布坐标系。base_link 表示用 target_frame
-    depth_wall_output_frame: map
+    # ---------- 深度预处理（严格顺序）----------
+    # 1) crop：Z∈[depth_z_min, depth_z_max]，水平距离∈[depth_range_min, depth_range_max]
+    # 2) 各向同性 VoxelGrid：leaf×leaf×leaf（默认 2cm×2cm×2cm）
+    # 3) 点数 ≥ depth_ror_min_points 时 RadiusOutlierRemoval 粗剔（可选）
+    # 4) StatisticalOutlierRemoval 精修（可选）
+    # 5) bilateral：几何双边平滑（对 XYZ）→ filtered=保留点；ROR/SOR 剔除进 deviate
+    depth_z_min: 0.05                # 深度 ROI 最低高度（米）
+    depth_z_max: 1.70                # 深度 ROI 最高高度（米）
+    depth_range_min: 0.10            # 深度 ROI 水平距离下限（米）
+    depth_range_max: 3.0             # 深度 ROI 水平距离上限（米）
+    depth_voxel_xy: 0.05             # 体素边长（米），XYZ 同为 leaf（2cm×2cm×2cm）
+    depth_ror_enable: true           # 是否启用半径离群粗剔（点数够时）
+    depth_ror_min_points: 200        # 体素后点数少于此则跳过 ROR
+    depth_ror_radius: 0.05           # ROR 搜索半径（米）
+    depth_ror_min_neighbors: 4       # 半径内最少邻域点数（含自身规则以 PCL 为准）
+    depth_sor_enable: true           # 是否启用统计离群精修
+    depth_sor_mean_k: 20             # SOR 邻域点数 K
+    depth_sor_stddev_mul: 1.0        # SOR 标准差倍数（越大越宽松）
+    depth_bilateral_enable: true     # 是否启用几何双边平滑
+    depth_bilateral_sigma_s: 0.04    # 双边空间 sigma（米）
+    depth_bilateral_sigma_r: 0.03    # 双边值域 sigma（|Δz|，米）
 
-    # 兼容旧配置。深度找墙已改为每路相机回调内独立 Hough+跟踪，不再走融合定时器。
-    depth_wall_fuse_hz: 10.0
-    # 墙带抹点时，其它相机跟踪结果允许的最大时间差（秒）。
-    depth_merge_max_age: 0.5
-    # LINE_LIST 边线宽度；墙面高度用每条线支撑点的 z_min/z_max（缺省回退 hough.z_*）。
-    wall_line_width: 0.04
-    # 仅拐角点 Marker 的显示高度（米）；墙面几何不再使用该值。
-    wall_display_z: 0.10
-    # Marker 寿命宜 ≥ lose_sec；空观测会重发上一帧并刷新 lifetime。
-    wall_marker_lifetime: 3.0
+    # ---------- 发布前墙带裁剪（跟踪之后）----------
+    # |n·xy-ρ| ≤ band：保留并可投影到竖直墙；band~outer：甩到 deviate；更远：当障碍物保留
+    depth_wall_band_m: 0.05          # 贴墙内带宽度（米）
+    depth_wall_band_outer_m: 0.12    # 噪声外带上限（米）；介于 band~outer 的点进 deviate
+    depth_wall_project: true         # 带内点是否投影到墙平面
+    depth_wall_noise_k: 0.005        # 距离相关噪声带系数：k·r²
+    depth_wall_noise_max: 0.06       # 噪声带上限（米）
+    depth_wall_range_max: 3.0        # 找墙用水平距离上限（米，与 depth_range_max 一致）
+    depth_wall_ground_margin: 0.08   # 地面上抬切掉高度（米）
+    depth_ground_ref_z: 0.0          # 地面参考高度（米）
+    wall_fuse_min_support_points: 10 # 多相机墙线融合最小支撑点数
+    depth_merge_max_age: 0.5         # 融合墙结果可用的最大时间差（秒）
+    depth_wall_tf_report_sec: 5.0    # TF 失败率日志周期（秒）
 
-    # 墙跟踪稳态（深度/雷达共用）。伸长立刻，缩短要 shorten_frames；丢检 coast lose_sec。
+    # ========== 墙跟踪 / KF（深度每相机与雷达共用 wall_track）==========
+    # 观测关联 → confirm_frames 确认 → 丢检时 coast（lose_sec）→ 可选 KF 平滑 ρ/θ/端点
     wall_track:
-      normal_gate: 0.15             # 米；关联法向缓冲
-      merge_gap: 0.25               # 米；沿线重叠允许间隙
-      obs_weight: 0.25              # 观测融合权重，越小越稳
-      confirm_frames: 1             # 先尽快出墙；稳了可改回 2~3
-      shorten_frames: 5             # 连续缩短才收端点
-      lose_sec: 2.0                 # 秒；确认墙丢失后继续保持
+      normal_gate: 0.30              # 关联：法向距离门限（米量级）
+      merge_gap: 0.35                # 关联：沿墙方向端点间隙允许（米）
+      obs_weight: 0.40               # 非 KF 时观测融合权重（0~1）
+      confirm_frames: 2              # 连续命中多少帧才确认输出
+      shorten_frames: 5              # 端点连续缩短多少帧才真正缩短（clamp_extent_to_obs=false 时）
+      lose_sec: 2.50                 # 确认后丢检保持时长（秒）
+      coast_gate_extra: 0.15         # coast 时额外放宽关联门限（米）
+      clamp_extent_to_obs: true      # true：匹配更新直接采用观测端点，禁止长出本帧支撑
+      kf_enable: true                # 启用 4 维 KF（ρ, θ, 两端弧长参数）
+      kf_q_rho: 6.4e-5                # 过程噪声 Q：ρ（米²/时间尺度）
+      kf_q_theta: 1e-4             # 过程噪声 Q：θ（弧度²/时间尺度）
+      kf_q_end: 6.25e-4                 # 过程噪声 Q：端点（米²/时间尺度）
+      kf_r_rho: 2.5e-3               # 观测噪声 R：ρ（米²）
+      kf_r_theta: 0.001              # 观测噪声 R：θ（弧度²）
+      kf_r_end: 0.01                 # 观测噪声 R：端点（米²）
 
-    # 电梯门开闭（target_frame/base_link 前方 ROI）。话题 /wall_plane_filter/elevator_door_status
-    # state: 0=UNKNOWN 1=OPEN 2=CLOSED。雷达每帧 + 前视深度参与投票。
-    elevator_door_enable: true
-    elevator_door_x_min: 0.40       # 米；门 ROI 近端
-    elevator_door_x_max: 2.50       # 米；门 ROI 远端
-    elevator_door_half_width: 0.55  # 米；门半宽（总宽约 1.1 m）
-    elevator_door_z_min: 0.20
-    elevator_door_z_max: 1.40
-    elevator_door_open_margin: 0.35 # 米；比近平面更远超过该值算缺口
-    elevator_door_open_ratio: 0.45  # 缺口柱占比 ≥ 此值判开
-    elevator_door_bins: 11
-    elevator_door_min_points_bin: 3
-    elevator_door_min_valid_bins: 4
-    elevator_door_vote_frames: 4    # 连续同结论才切换状态
+    # ========== 找线前端 extractor：hough | ransac | seed_grow ==========
+    # depth_hough / lidar_hough 可分别配置。
 
-    # 两种传感器共享提取器，分别配置；只在各自原始二值图上验证。
     depth_hough:
-      resolution: 0.05              # 米/栅格；>=0.01
-      half_extent: 6.0              # 米；正方形投影范围半边长
-      max_grid_side: 512            # 格；硬性上限（最多1024），超限启动报错
-      follow_sensor: true           # true: 原点留在 map，机器人快离开半幅才整格平移
-      origin_x: -6.0                # 米；false 时固定原点，深度在 map 系
-      origin_y: -6.0                # 米；false 时固定原点
-      min_cell_points: 2            # 点/栅格；投影前体素点数
-      min_cell_height: 0.05         # 米；栅格中实测z跨度，抑制单层水平表面
-      z_min: 0.05                   # 米；投影前在 target_frame 下筛选高度
-      z_max: 1.50                   # 米；按实际地板/天花板高度调整
-      theta_deg: 1.0                # 度；Hough角度分辨率
-      votes: 6                     # 票；Hough峰值（略放宽便于出墙）
-      min_line_length: 0.40         # 米；Hough和最终墙线的最短长度
-      hough_max_gap: 0.15           # 米；Hough检测允许连接的像素间隙
-      merge_angle_deg: 5.0          # 度；重复线段方向误差
-      merge_distance: 0.06         # 米；重复线段法向距离
-      merge_gap: 0.15              # 米；重复线段沿线最大间隙
-      parallel_angle_deg: 10.0      # 度；夹角小于此值不求交点
-      intersection_extension: 0.20  # 米；交点最多超出每条线的端点距离
-      support_band: 0.10            # 米；支撑邻域半宽，>=0.71*resolution，<=10格
-      min_support_ratio: 0.55       # 0~1；原始二值图占据支撑比例
-      max_unsupported_gap: 0.25     # 米；连续无支撑超过此值必须拆开
-      min_continuous_support: 0.10  # 米；至少有这么长的连续占据支撑
-      min_support_points: 6         # 点；最终线段附近真实三维点数
-      max_lines: 80                 # 条；Hough候选上限，限制求交开销（最多256）
-      refine: true                 # 原始支撑点TLS精修，精修后再次验证
-      debug: false                 # 发布 binary OccupancyGrid + debug_markers
+      extractor: hough               # 找线算法：hough | ransac | seed_grow
+      resolution: 0.05               # 占据栅格分辨率（米/格）
+      half_extent: 3.0               # 栅格半边长（米）；与 3m ROI 一致
+      max_grid_side: 512             # 栅格单边最大格数
+      follow_sensor: true            # true：栅格中心跟随传感器；false：用 origin_*
+      origin_x: -3.0                 # follow_sensor=false 时栅格原点 X（米）
+      origin_y: -3.0                 # follow_sensor=false 时栅格原点 Y（米）
+      min_cell_points: 3             # 栅格占用最少点数
+      min_cell_height: 0.05          # 栅格占用最少高度跨度（米，hough 用）
+      z_min: 0.05                    # 找墙高度带下限（米）
+      z_max: 1.70                    # 找墙高度带上限（米）
+      theta_deg: 1.0                 # HoughLinesP 角度分辨率（度）
+      votes: 10                      # HoughLinesP 最小投票数
+      min_line_length: 0.40          # 最短墙段长度（米）
+      hough_max_gap: 0.15            # HoughLinesP 允许间隙（米）
+      merge_angle_deg: 6.0           # 候选线合并最大夹角（度）
+      merge_distance: 0.08           # 候选线合并法向距离门限（米）
+      merge_gap: 0.25                # 候选线合并沿墙间隙允许（米）
+      parallel_angle_deg: 10.0       # 小于此夹角视为平行（不做拐角交点，度）
+      intersection_extension: 0.50   # 交点允许超出线段端点的距离（米）；也作 corner_snap 默认距
+      support_band: 0.12             # 支撑点到直线的法向带宽（米）
+      min_support_ratio: 0.65        # 支撑区间命中比例下限（0~1）
+      max_unsupported_gap: 0.20      # 允许的最大无支撑间隙（米）
+      min_continuous_support: 0.15   # 最短连续支撑长度（米）
+      min_support_points: 8          # 最少支撑点数
+      max_lines: 80                  # 单帧最多输出墙段数
+      refine: true                   # 是否用支撑点 TLS 精修直线
+      debug: false                   # 是否输出调试信息
+      ransac_distance: 0.0           # RANSAC 内点距离阈值（米）；≤0 用 support_band
+      ransac_min_inliers: 20         # RANSAC 最少内点数
+      ransac_max_iterations: 150     # RANSAC 最大迭代次数
+      ransac_downsample_leaf: 0.04   # RANSAC 前 XY 降采样边长（米）
+      seed_contour_angle_deg: 1.0    # seed_grow 方位角分箱（度）
+      seed_min_points: 6             # 种子段最少点数
+      seed_max_distance: 0.0         # 种子拟合距离阈值（米）；≤0 用 support_band
+      grow_distance: 0.0             # 生长距离阈值（米）；≤0 用 support_band
+      grow_max_gap_bins: 2           # 生长允许跨越的最大空分箱数
+      grow_max_range_jump: 0.35      # 生长相邻分箱最大距离跳变（米）
 
     lidar_hough:
-      resolution: 0.06              # 米/格
-      half_extent: 6.0              # 米
-      max_grid_side: 512            # 格
-      follow_sensor: true           # 雷达投影在 target_frame，中心为机器人原点
-      origin_x: -6.0                # 米；固定原点模式
-      origin_y: -6.0                # 米
-      min_cell_points: 2            # 点/格
-      min_cell_height: 0.05         # 米
-      z_min: 0.15                   # 米；target_frame，下限排除地面
-      z_max: 1.50                   # 米；target_frame，上限排除顶面
-      theta_deg: 1.0                # 度
-      votes: 8                     # 票
-      min_line_length: 0.50         # 米
-      hough_max_gap: 0.15           # 米
-      merge_angle_deg: 5.0          # 度
-      merge_distance: 0.08         # 米
-      merge_gap: 0.15              # 米
-      parallel_angle_deg: 10.0      # 度
-      intersection_extension: 0.20  # 米
-      support_band: 0.10            # 米；半宽
-      min_support_ratio: 0.70       # 比例
-      max_unsupported_gap: 0.18     # 米
-      min_continuous_support: 0.15  # 米
-      min_support_points: 10        # 点
-      max_lines: 80                 # 条
-      refine: true
-      debug: false
+      extractor: hough               # 找线算法：hough | ransac | seed_grow
+      resolution: 0.05               # 占据栅格分辨率（米/格）
+      half_extent: 3.0               # 栅格半边长（米）；与 3m ROI 一致
+      max_grid_side: 512             # 栅格单边最大格数
+      follow_sensor: true            # true：栅格中心跟随传感器；false：用 origin_*
+      origin_x: -3.0                 # follow_sensor=false 时栅格原点 X（米）
+      origin_y: -3.0                 # follow_sensor=false 时栅格原点 Y（米）
+      min_cell_points: 2             # 栅格占用最少点数
+      min_cell_height: 0.05          # 栅格占用最少高度跨度（米）
+      z_min: 0.05                    # 找墙高度带下限（米）
+      z_max: 1.80                    # 找墙高度带上限（米）
+      theta_deg: 1.0                 # HoughLinesP 角度分辨率（度）
+      votes: 8                       # HoughLinesP 最小投票数
+      min_line_length: 0.50          # 最短墙段长度（米）
+      hough_max_gap: 0.20            # HoughLinesP 允许间隙（米）
+      merge_angle_deg: 6.0           # 候选线合并最大夹角（度）
+      merge_distance: 0.10           # 候选线合并法向距离门限（米）
+      merge_gap: 0.30                # 候选线合并沿墙间隙允许（米）
+      parallel_angle_deg: 10.0       # 小于此夹角视为平行（度）
+      intersection_extension: 0.50   # 交点延伸 / corner_snap 默认距（米）
+      support_band: 0.15             # 支撑点到直线的法向带宽（米）
+      min_support_ratio: 0.60        # 支撑区间命中比例下限（0~1）
+      max_unsupported_gap: 0.25      # 允许的最大无支撑间隙（米）
+      min_continuous_support: 0.15   # 最短连续支撑长度（米）
+      min_support_points: 8          # 最少支撑点数
+      max_lines: 80                  # 单帧最多输出墙段数
+      refine: true                   # 是否用支撑点 TLS 精修直线
+      debug: false                   # 是否输出调试信息
+      ransac_distance: 0.0           # RANSAC 内点距离阈值（米）；≤0 用 support_band
+      ransac_min_inliers: 25         # RANSAC 最少内点数
+      ransac_max_iterations: 150     # RANSAC 最大迭代次数
+      ransac_downsample_leaf: 0.05   # RANSAC 前 XY 降采样边长（米）
+      seed_contour_angle_deg: 1.0    # seed_grow 方位角分箱（度）
+      seed_min_points: 6             # 种子段最少点数
+      seed_max_distance: 0.0         # 种子拟合距离阈值（米）；≤0 用 support_band
+      grow_distance: 0.0             # 生长距离阈值（米）；≤0 用 support_band
+      grow_max_gap_bins: 2           # 生长允许跨越的最大空分箱数
+      grow_max_range_jump: 0.40      # 生长相邻分箱最大距离跳变（米）
