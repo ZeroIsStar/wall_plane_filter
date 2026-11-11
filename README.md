@@ -28,7 +28,7 @@ ros2 run wall_plane_filter wall_plane_filter_node --ros-args \
   --params-file /src/wall_plane_filter/config/wall_plane_filter.yaml
 ```
 
-依赖：深度/雷达点云话题、以及 `target_frame`（默认 `base_link`）与 `depth_wall_map_frame`（默认 `map`）之间的 TF。
+依赖：深度/雷达点云话题、以及 `target_frame`（默认 `base_link`）与 `depth_wall_map_frame`（默认 `map`）之间的 TF。深度/雷达过滤点云仅在能变换到 `depth_wall_output_frame`（默认 `map`）时发布；TF 失败只打日志，不回退到 `base_link`。
 
 ---
 

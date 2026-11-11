@@ -54,10 +54,10 @@ private:
   void reportDepthTf();
   bool lookupIso(
     const std::string & to_frame, const std::string & from_frame, const rclcpp::Time & stamp,
-    Eigen::Isometry3d & out);
+    Eigen::Isometry3d & out, std::string * reason = nullptr);
   bool transformCloud(
     const CloudT & in, const std::string & to_frame, const std::string & from_frame,
-    const rclcpp::Time & stamp, CloudT & out);
+    const rclcpp::Time & stamp, CloudT & out, std::string * reason = nullptr);
   std::string wallWorkFrame() const;
   std::string outputFrame() const;
   void clearWallCachesOnTimeJump(const rclcpp::Time & stamp);

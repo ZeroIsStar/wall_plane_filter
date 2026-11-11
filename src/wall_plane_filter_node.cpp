@@ -13,6 +13,7 @@
 
 #include <algorithm>
 #include <cmath>
+#include <cstddef>
 #include <cstdint>
 #include <limits>
 #include <stdexcept>
@@ -292,6 +293,79 @@ bool tryFuseWallLine(
   a.a = na; a.b = nb;
   a.support_points = std::max(a.support_points, b.support_points);
   return true;
+}
+
+struct ResidualStats
+{
+  size_t count{0};
+  double min_e{0}, max_e{0}, mean_e{0}, rms{0};
+  double min_abs{0}, max_abs{0}, mean_abs{0}, std_abs{0};
+};
+
+ResidualStats accumulateResiduals(const std::vector<double> & errs)
+{
+  ResidualStats s;
+  if (errs.empty()) {return s;}
+  s.count = errs.size();
+  s.min_e = s.max_e = errs.front();
+  double sum = 0, sum_sq = 0, sum_abs = 0, sum_abs_sq = 0;
+  s.min_abs = s.max_abs = std::abs(errs.front());
+  for (double e : errs) {
+    const double ae = std::abs(e);
+    s.min_e = std::min(s.min_e, e);
+    s.max_e = std::max(s.max_e, e);
+    s.min_abs = std::min(s.min_abs, ae);
+    s.max_abs = std::max(s.max_abs, ae);
+    sum += e;
+    sum_sq += e * e;
+    sum_abs += ae;
+    sum_abs_sq += ae * ae;
+  }
+  const double n = static_cast<double>(s.count);
+  s.mean_e = sum / n;
+  s.rms = std::sqrt(sum_sq / n);
+  s.mean_abs = sum_abs / n;
+  const double var = std::max(0.0, sum_abs_sq / n - s.mean_abs * s.mean_abs);
+  s.std_abs = std::sqrt(var);
+  return s;
+}
+
+/** Support-point normal residuals e = n·xy − ρ within support_band on each wall segment. */
+void collectWallSupportResiduals(
+  const std::vector<WallLine> & lines, const CloudT & cloud, double support_band,
+  std::vector<ResidualStats> & per_wall, ResidualStats & global, std::vector<double> & all_abs)
+{
+  per_wall.assign(lines.size(), ResidualStats{});
+  global = ResidualStats{};
+  all_abs.clear();
+  if (lines.empty() || cloud.empty() || !(support_band > 0.0)) {return;}
+  std::vector<double> all_signed;
+  all_signed.reserve(cloud.size());
+  for (size_t wi = 0; wi < lines.size(); ++wi) {
+    const WallLine & line = lines[wi];
+    const double len = (line.b - line.a).norm();
+    if (len < 1e-9) {continue;}
+    Eigen::Vector2d d = (line.b - line.a) / len;
+    Eigen::Vector2d n = line.normal;
+    const double nn = n.norm();
+    if (nn > 1e-9) {n /= nn;} else {n = Eigen::Vector2d(-d.y(), d.x());}
+    const double rho = n.dot(line.a);
+    std::vector<double> errs;
+    errs.reserve(64);
+    for (const auto & p : cloud.points) {
+      if (!std::isfinite(p.x) || !std::isfinite(p.y) || !std::isfinite(p.z)) {continue;}
+      const Eigen::Vector2d xy(p.x, p.y);
+      const double e = n.dot(xy) - rho;
+      if (std::abs(e) > support_band) {continue;}
+      const double t = d.dot(xy - line.a);
+      if (t < -1e-6 || t > len + 1e-6) {continue;}
+      errs.push_back(e);
+      all_signed.push_back(e);
+      all_abs.push_back(std::abs(e));
+    }
+    per_wall[wi] = accumulateResiduals(errs);
+  }
+  global = accumulateResiduals(all_signed);
 }
 
 void finalizeWallGeometry(
@@ -626,30 +700,42 @@ std::string WallPlaneFilterNode::outputFrame() const
 
 bool WallPlaneFilterNode::lookupIso(
   const std::string & to_frame, const std::string & from_frame, const rclcpp::Time & stamp,
-  Eigen::Isometry3d & out)
+  Eigen::Isometry3d & out, std::string * reason)
 {
-  if (to_frame.empty() || from_frame.empty() || to_frame == from_frame) {
+  if (reason) {reason->clear();}
+  if (to_frame.empty() || from_frame.empty()) {
+    if (reason) {
+      *reason = "empty frame (to='" + to_frame + "', from='" + from_frame + "')";
+    }
+    return false;
+  }
+  if (to_frame == from_frame) {
     out = Eigen::Isometry3d::Identity();
-    return to_frame == from_frame || (!to_frame.empty() && !from_frame.empty());
+    return true;
   }
   try {
     const auto tf = tf_buffer_->lookupTransform(
       to_frame, from_frame, stamp, rclcpp::Duration::from_seconds(params_.tf_timeout));
     out = tf2::transformToEigen(tf.transform);
     return true;
-  } catch (const std::exception &) {
+  } catch (const std::exception & e) {
+    if (reason) {*reason = e.what();}
     return false;
   }
 }
 
 bool WallPlaneFilterNode::transformCloud(
   const CloudT & in, const std::string & to_frame, const std::string & from_frame,
-  const rclcpp::Time & stamp, CloudT & out)
+  const rclcpp::Time & stamp, CloudT & out, std::string * reason)
 {
   Eigen::Isometry3d T = Eigen::Isometry3d::Identity();
-  if (!(to_frame == from_frame || lookupIso(to_frame, from_frame, stamp, T))) {
+  if (!(to_frame == from_frame || lookupIso(to_frame, from_frame, stamp, T, reason))) {
+    if (reason && reason->empty()) {
+      *reason = "lookup failed " + from_frame + " -> " + to_frame;
+    }
     return false;
   }
+  if (reason) {reason->clear();}
   transformInto(in, T, out);
   return true;
 }
@@ -738,8 +824,22 @@ void WallPlaneFilterNode::cloudCallback(
 
   Eigen::Isometry3d T_bc = Eigen::Isometry3d::Identity();
   Eigen::Isometry3d T_wb = Eigen::Isometry3d::Identity();
-  if (!lookupIso(params_.target_frame, msg->header.frame_id, lookup_stamp, T_bc)) {return;}
-  if (!lookupIso(world, params_.target_frame, lookup_stamp, T_wb)) {return;}
+  std::string tf_reason;
+  if (!lookupIso(params_.target_frame, msg->header.frame_id, lookup_stamp, T_bc, &tf_reason)) {
+    RCLCPP_WARN_THROTTLE(
+      get_logger(), *get_clock(), 2000,
+      "lidar TF fail stage=sensor->%s from=%s stamp=%.3f reason=%s (skip frame, no cloud publish)",
+      params_.target_frame.c_str(), msg->header.frame_id.c_str(), stamp.seconds(),
+      tf_reason.c_str());
+    return;
+  }
+  if (!lookupIso(world, params_.target_frame, lookup_stamp, T_wb, &tf_reason)) {
+    RCLCPP_WARN_THROTTLE(
+      get_logger(), *get_clock(), 2000,
+      "lidar TF fail stage=%s->%s stamp=%.3f reason=%s (skip frame, no cloud publish)",
+      params_.target_frame.c_str(), world.c_str(), stamp.seconds(), tf_reason.c_str());
+    return;
+  }
 
   CloudT raw;
   pcl::fromROSMsg(*msg, raw);
@@ -775,11 +875,14 @@ void WallPlaneFilterNode::cloudCallback(
     transformInto(filtered, T_wb, filtered_world);
     const std::string out_frame = outputFrame();
     CloudT out;
-    if (transformCloud(filtered_world, out_frame, world, stamp, out)) {
+    std::string out_reason;
+    if (transformCloud(filtered_world, out_frame, world, stamp, out, &out_reason)) {
       publishCloud(lidar_filtered_pub_, lidar_filtered_pub_be_, toMsg(out, stamp, out_frame));
     } else {
-      publishCloud(
-        lidar_filtered_pub_, lidar_filtered_pub_be_, toMsg(filtered_world, stamp, world));
+      RCLCPP_WARN_THROTTLE(
+        get_logger(), *get_clock(), 2000,
+        "lidar filtered cloud TF fail from=%s to=%s stamp=%.3f reason=%s (skip publish)",
+        world.c_str(), out_frame.c_str(), stamp.seconds(), out_reason.c_str());
     }
   }
 
@@ -897,14 +1000,36 @@ void WallPlaneFilterNode::depthCallback(
   }
   Eigen::Isometry3d T_bc = Eigen::Isometry3d::Identity();
   Eigen::Isometry3d T_wb = Eigen::Isometry3d::Identity();
-  const bool base_ok = lookupIso(params_.target_frame, msg->header.frame_id, lookup_stamp, T_bc);
-  const bool map_ok = base_ok && lookupIso(world, params_.target_frame, lookup_stamp, T_wb);
+  std::string base_reason;
+  std::string map_reason;
+  const bool base_ok = lookupIso(
+    params_.target_frame, msg->header.frame_id, lookup_stamp, T_bc, &base_reason);
+  const bool map_ok = base_ok &&
+    lookupIso(world, params_.target_frame, lookup_stamp, T_wb, &map_reason);
   if (!map_ok) {
     std::lock_guard<std::mutex> lock(depth_tf_mutex_);
     ++depth_tf_fail_[idx];
   }
   reportDepthTf();
-  if (!base_ok) {return;}
+  if (!base_ok) {
+    RCLCPP_WARN_THROTTLE(
+      get_logger(), *get_clock(), 2000,
+      "depth TF fail camera=%s stage=sensor->%s from=%s to=%s world=%s stamp=%.3f "
+      "reason=%s (skip frame, no cloud publish)",
+      depth_cam_names_[idx].c_str(), params_.target_frame.c_str(), msg->header.frame_id.c_str(),
+      params_.target_frame.c_str(), world.c_str(), stamp.seconds(), base_reason.c_str());
+    return;
+  }
+  if (!map_ok) {
+    RCLCPP_WARN_THROTTLE(
+      get_logger(), *get_clock(), 2000,
+      "depth TF fail camera=%s stage=%s->%s from=%s to=%s world=%s stamp=%.3f "
+      "reason=%s (skip map wall + no cloud publish)",
+      depth_cam_names_[idx].c_str(), params_.target_frame.c_str(), world.c_str(),
+      msg->header.frame_id.c_str(), params_.target_frame.c_str(), world.c_str(),
+      stamp.seconds(), map_reason.c_str());
+    return;
+  }
 
   CloudT raw;
   pcl::fromROSMsg(*msg, raw);
@@ -918,16 +1043,6 @@ void WallPlaneFilterNode::depthCallback(
     depth_cam_names_[idx].c_str(), prep.crop, prep.voxel, prep.ror_drop, prep.sor_drop,
     prep.bilateral ? 1 : 0, prep.out, params_.depth_z_min, params_.depth_z_max,
     params_.depth_range_max, params_.depth_voxel_xy);
-
-  if (!map_ok) {
-    publishCloud(
-      depth_filtered_pubs_[idx], depth_filtered_pubs_be_[idx],
-      toMsg(filtered, stamp, params_.target_frame));
-    publishCloud(
-      depth_deviate_pubs_[idx], depth_deviate_pubs_be_[idx],
-      toMsg(deviate, stamp, params_.target_frame));
-    return;
-  }
 
   DepthSlot slot;
   transformInto(filtered, T_wb, slot.filtered_world);
@@ -971,6 +1086,41 @@ void WallPlaneFilterNode::processDepthWalls(
   const auto result = extractHoughWalls(wall_world, robot_xy, params_.depth_hough);
   std::vector<WallLine> observations = result.lines;
   finalizeWallGeometry(observations, &wall_world, params_.depth_hough, params_);
+
+  {
+    std::vector<ResidualStats> per_wall;
+    ResidualStats global;
+    std::vector<double> all_abs;
+    collectWallSupportResiduals(
+      observations, wall_world, params_.depth_hough.support_band, per_wall, global, all_abs);
+    double p95_abs = 0.0;
+    if (!all_abs.empty()) {
+      std::vector<double> sorted = all_abs;
+      const size_t k = static_cast<size_t>(
+        std::min(sorted.size() - 1, static_cast<size_t>(0.95 * (sorted.size() - 1))));
+      std::nth_element(sorted.begin(), sorted.begin() + static_cast<std::ptrdiff_t>(k), sorted.end());
+      p95_abs = sorted[k];
+    }
+    RCLCPP_INFO_THROTTLE(
+      get_logger(), *get_clock(), 2000,
+      "wall residual %s walls=%zu pts=%zu |e| min=%.4f max=%.4f mean=%.4f rms=%.4f "
+      "std=%.4f p95=%.4f signed min=%.4f max=%.4f mean=%.4f",
+      depth_cam_names_[idx].c_str(), observations.size(), global.count,
+      global.min_abs, global.max_abs, global.mean_abs, global.rms, global.std_abs, p95_abs,
+      global.min_e, global.max_e, global.mean_e);
+    for (size_t wi = 0; wi < observations.size() && wi < per_wall.size(); ++wi) {
+      const auto & w = observations[wi];
+      const auto & s = per_wall[wi];
+      if (s.count == 0) {continue;}
+      RCLCPP_INFO_THROTTLE(
+        get_logger(), *get_clock(), 2000,
+        "wall residual %s[%zu] len=%.2f support=%zu/%zu |e| min=%.4f max=%.4f mean=%.4f "
+        "rms=%.4f sigma=%.4f signed min=%.4f max=%.4f mean=%.4f",
+        depth_cam_names_[idx].c_str(), wi, (w.b - w.a).norm(), s.count, w.support_points,
+        s.min_abs, s.max_abs, s.mean_abs, s.rms, w.sigma, s.min_e, s.max_e, s.mean_e);
+    }
+  }
+
   const WallTrackConfig track_cfg = trackConfigFrom(params_.depth_hough, params_.wall_track);
   std::vector<WallLine> cam_tracked;
   WallTrackUpdateStats stats;
@@ -1093,23 +1243,28 @@ void WallPlaneFilterNode::publishDepthCloud(size_t idx, const DepthSlot & slot)
   const std::string world = wallWorkFrame();
   const std::string out_frame = outputFrame();
   CloudT filtered_out, deviate_out;
-  if (transformCloud(filtered, out_frame, world, slot.stamp, filtered_out) &&
-    transformCloud(deviate, out_frame, world, slot.stamp, deviate_out))
-  {
-    publishCloud(
-      depth_filtered_pubs_[idx], depth_filtered_pubs_be_[idx],
-      toMsg(filtered_out, slot.stamp, out_frame));
-    publishCloud(
-      depth_deviate_pubs_[idx], depth_deviate_pubs_be_[idx],
-      toMsg(deviate_out, slot.stamp, out_frame));
-  } else {
-    publishCloud(
-      depth_filtered_pubs_[idx], depth_filtered_pubs_be_[idx],
-      toMsg(filtered, slot.stamp, world));
-    publishCloud(
-      depth_deviate_pubs_[idx], depth_deviate_pubs_be_[idx],
-      toMsg(deviate, slot.stamp, world));
+  std::string filt_reason;
+  std::string dev_reason;
+  const bool filt_ok = transformCloud(
+    filtered, out_frame, world, slot.stamp, filtered_out, &filt_reason);
+  const bool dev_ok = transformCloud(
+    deviate, out_frame, world, slot.stamp, deviate_out, &dev_reason);
+  if (!(filt_ok && dev_ok)) {
+    RCLCPP_WARN_THROTTLE(
+      get_logger(), *get_clock(), 2000,
+      "depth cloud publish TF fail camera=%s idx=%zu from=%s to=%s stamp=%.3f "
+      "filtered_ok=%d reason=%s deviate_ok=%d reason=%s (skip publish)",
+      idx < depth_cam_names_.size() ? depth_cam_names_[idx].c_str() : "?",
+      idx, world.c_str(), out_frame.c_str(), slot.stamp.seconds(),
+      filt_ok ? 1 : 0, filt_reason.c_str(), dev_ok ? 1 : 0, dev_reason.c_str());
+    return;
   }
+  publishCloud(
+    depth_filtered_pubs_[idx], depth_filtered_pubs_be_[idx],
+    toMsg(filtered_out, slot.stamp, out_frame));
+  publishCloud(
+    depth_deviate_pubs_[idx], depth_deviate_pubs_be_[idx],
+    toMsg(deviate_out, slot.stamp, out_frame));
 }
 
 }  // namespace wall_plane_filter
