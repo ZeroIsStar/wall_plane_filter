@@ -18,11 +18,16 @@ struct Params
   double wall_display_z{0.10};
   double wall_marker_lifetime{2.0};
   double wall_marker_publish_hz{20.0};
+  // Per-wall support residual TEXT markers (RViz): |e|=n·xy−ρ within support_band.
+  bool wall_residual_marker_enable{true};
+  double wall_residual_marker_z_offset{0.15};  // above wall mid-height (m)
+  double wall_residual_text_size{0.08};        // Marker scale.z (m)
+  std::string wall_residual_unit{"mm"};        // "mm" | "cm" | "m"
 
   std::string target_frame{"base_link"};
   double tf_timeout{0.25};
 
-  // Lidar: ROI + voxel → extract → WallTracker+KF
+  // Lidar: ROI + voxel → (optional XY hist) → (optional ROR) → (optional SOR) → bilateral
   std::string cloud_topic{"/vanjee/lidar"};
   bool lidar_wall_enable{true};
   bool publish_cloud_filtered{false};
@@ -31,6 +36,21 @@ struct Params
   double range_min{0.20};
   double range_max{3.0};              // lidar ROI horizontal max (m)
   double voxel_leaf{0.05};
+  bool lidar_xy_hist_enable{true};    // XY density histogram after voxel, before ROR
+  double lidar_xy_hist_cell{0.10};    // XY bin size (m), ~2× voxel_leaf
+  int lidar_xy_hist_min_points{3};    // drop cell if count < this
+  bool lidar_xy_hist_range_scale{true};  // relax threshold with range
+  int lidar_xy_hist_min_points_far{2};   // threshold near range_max
+  bool lidar_ror_enable{true};
+  int lidar_ror_min_points{200};       // skip ROR when fewer points after voxel
+  double lidar_ror_radius{0.05};       // RadiusOutlierRemoval search radius (m)
+  int lidar_ror_min_neighbors{4};      // min neighbors in radius
+  bool lidar_sor_enable{true};
+  int lidar_sor_mean_k{20};
+  double lidar_sor_stddev_mul{1.0};
+  bool lidar_bilateral_enable{true};
+  double lidar_bilateral_sigma_s{0.04};
+  double lidar_bilateral_sigma_r{0.03};
   double lidar_wall_range_max{3.0};   // lidar wall-extract range (m)
 
   // Corner lock + support extent clamp (shared by depth / lidar publish paths).
@@ -47,12 +67,17 @@ struct Params
     "/camera4/depth/points"};
   std::vector<std::string> depth_wall_cameras{"camera1", "camera2", "camera3", "camera4"};
 
-  // Preprocess: crop → isotropic VoxelGrid → (optional ROR) → SOR → bilateral.
+  // Preprocess: crop → Voxel → (optional XY hist) → (optional ROR) → SOR → bilateral.
   double depth_z_min{0.05};
   double depth_z_max{1.70};
   double depth_range_min{0.10};
   double depth_range_max{3.0};
   double depth_voxel_xy{0.02};  // isotropic leaf (m): leaf×leaf×leaf
+  bool depth_xy_hist_enable{true};    // XY density histogram after voxel, before ROR
+  double depth_xy_hist_cell{0.10};    // XY bin size (m), ~2× depth_voxel_xy
+  int depth_xy_hist_min_points{3};    // drop cell if count < this
+  bool depth_xy_hist_range_scale{true};  // relax threshold with range
+  int depth_xy_hist_min_points_far{2};   // threshold near depth_range_max
   bool depth_ror_enable{true};
   int depth_ror_min_points{200};       // skip ROR when fewer points
   double depth_ror_radius{0.05};       // RadiusOutlierRemoval search radius (m)

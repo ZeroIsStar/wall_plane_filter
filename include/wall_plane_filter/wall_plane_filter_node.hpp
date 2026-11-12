@@ -46,11 +46,12 @@ private:
     size_t idx, const CloudT & wall_world, const Eigen::Vector2d & robot_xy,
     const rclcpp::Time & stamp);
   void publishLidarWalls(
-    const std::vector<WallLine> & lines, const rclcpp::Time & stamp, const std::string & frame);
+    const std::vector<WallLine> & lines, const rclcpp::Time & stamp, const std::string & frame,
+    const CloudT * support_cloud);
   void publishDepthCloud(size_t idx, const DepthSlot & slot);
   void publishCamWalls(
     size_t idx, const std::vector<WallLine> & lines, const rclcpp::Time & stamp,
-    const std::string & frame);
+    const std::string & frame, const CloudT * support_cloud);
   void reportDepthTf();
   bool lookupIso(
     const std::string & to_frame, const std::string & from_frame, const rclcpp::Time & stamp,

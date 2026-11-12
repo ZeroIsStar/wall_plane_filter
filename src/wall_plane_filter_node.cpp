@@ -15,9 +15,13 @@
 #include <cmath>
 #include <cstddef>
 #include <cstdint>
+#include <iomanip>
 #include <limits>
+#include <sstream>
 #include <stdexcept>
+#include <string>
 #include <utility>
+#include <vector>
 
 namespace wall_plane_filter
 {
@@ -78,6 +82,88 @@ void voxelDownsample(const CloudT & in, double leaf, CloudT & out)
   finishCloud(out);
 }
 
+// Drop sparse XY bins (after voxel, before ROR). Optional range-scaled threshold.
+// removed: optional sink for dropped points (depth deviate); nullptr skips collection.
+void xyDensityFilter(
+  const CloudT & in, CloudT & out,
+  double cell, int min_points,
+  bool range_scale, int min_points_far, double range_max,
+  CloudT * removed = nullptr)
+{
+  out.clear();
+  if (removed) {removed->clear();}
+  if (in.empty() || !(cell > 1e-9) || min_points < 1) {
+    out = in;
+    finishCloud(out);
+    if (removed) {finishCloud(*removed);}
+    return;
+  }
+
+  double xmin = std::numeric_limits<double>::infinity();
+  double ymin = std::numeric_limits<double>::infinity();
+  double xmax = -std::numeric_limits<double>::infinity();
+  double ymax = -std::numeric_limits<double>::infinity();
+  size_t valid_n = 0;
+  for (const auto & p : in.points) {
+    if (!std::isfinite(p.x) || !std::isfinite(p.y) || !std::isfinite(p.z)) {continue;}
+    xmin = std::min(xmin, static_cast<double>(p.x));
+    ymin = std::min(ymin, static_cast<double>(p.y));
+    xmax = std::max(xmax, static_cast<double>(p.x));
+    ymax = std::max(ymax, static_cast<double>(p.y));
+    ++valid_n;
+  }
+  if (valid_n == 0 || !std::isfinite(xmin) || !std::isfinite(ymin)) {
+    finishCloud(out);
+    if (removed) {finishCloud(*removed);}
+    return;
+  }
+
+  const int width = std::max(1, static_cast<int>(std::floor((xmax - xmin) / cell)) + 1);
+  const int height = std::max(1, static_cast<int>(std::floor((ymax - ymin) / cell)) + 1);
+  const size_t cells = static_cast<size_t>(width) * static_cast<size_t>(height);
+  std::vector<uint32_t> counts(cells, 0);
+  std::vector<int> cell_of(in.size(), -1);
+
+  for (size_t i = 0; i < in.size(); ++i) {
+    const auto & p = in.points[i];
+    if (!std::isfinite(p.x) || !std::isfinite(p.y) || !std::isfinite(p.z)) {continue;}
+    int ix = static_cast<int>(std::floor((static_cast<double>(p.x) - xmin) / cell));
+    int iy = static_cast<int>(std::floor((static_cast<double>(p.y) - ymin) / cell));
+    ix = std::clamp(ix, 0, width - 1);
+    iy = std::clamp(iy, 0, height - 1);
+    const size_t cell_i = static_cast<size_t>(iy) * static_cast<size_t>(width) +
+      static_cast<size_t>(ix);
+    ++counts[cell_i];
+    cell_of[i] = static_cast<int>(cell_i);
+  }
+
+  const int near_th = std::max(1, min_points);
+  const int far_th = std::max(1, min_points_far);
+  const double r_max = std::max(1e-6, range_max);
+  out.reserve(in.size());
+  if (removed) {removed->reserve(in.size() / 4 + 1);}
+  for (size_t i = 0; i < in.size(); ++i) {
+    const int cell_i = cell_of[i];
+    if (cell_i < 0) {continue;}
+    const auto & p = in.points[i];
+    int thresh = near_th;
+    if (range_scale) {
+      const double r = std::hypot(static_cast<double>(p.x), static_cast<double>(p.y));
+      const double t = std::clamp(r / r_max, 0.0, 1.0);
+      thresh = static_cast<int>(std::lround(
+        static_cast<double>(near_th) + t * (static_cast<double>(far_th) - static_cast<double>(near_th))));
+      thresh = std::max(1, thresh);
+    }
+    if (counts[static_cast<size_t>(cell_i)] < static_cast<uint32_t>(thresh)) {
+      if (removed) {removed->push_back(p);}
+      continue;
+    }
+    out.push_back(p);
+  }
+  finishCloud(out);
+  if (removed) {finishCloud(*removed);}
+}
+
 bool bilateralSmoothXyz(const CloudT & in, CloudT & out, double sigma_s, double sigma_r)
 {
   out.clear();
@@ -117,7 +203,8 @@ bool bilateralSmoothXyz(const CloudT & in, CloudT & out, double sigma_s, double 
 }
 
 struct PrepStats {
-  size_t crop{0}, voxel{0}, ror_drop{0}, sor_drop{0}, out{0}; bool bilateral{false};
+  size_t crop{0}, voxel{0}, xy_hist_drop{0}, ror_drop{0}, sor_drop{0}, out{0};
+  bool bilateral{false};
 };
 
 void appendRemoved(
@@ -130,6 +217,38 @@ void appendRemoved(
     deviate.push_back(src.points[static_cast<size_t>(i)]);
   }
   finishCloud(deviate);
+}
+
+// Optional ROR coarse reject then SOR refine (lidar path; no deviate cloud).
+void applyRorSor(
+  const CloudT & in, CloudT & out,
+  bool ror_enable, int ror_min_points, double ror_radius, int ror_min_neighbors,
+  bool sor_enable, int sor_mean_k, double sor_stddev_mul)
+{
+  CloudT after_ror = in;
+  if (ror_enable &&
+    in.size() >= static_cast<size_t>(std::max(1, ror_min_points)))
+  {
+    pcl::RadiusOutlierRemoval<pcl::PointXYZ> ror(true);
+    ror.setInputCloud(in.makeShared());
+    ror.setRadiusSearch(std::max(1e-4, ror_radius));
+    ror.setMinNeighborsInRadius(std::max(1, ror_min_neighbors));
+    ror.filter(after_ror);
+  }
+  finishCloud(after_ror);
+
+  CloudT after_sor = after_ror;
+  if (sor_enable &&
+    after_ror.size() >= static_cast<size_t>(std::max(3, sor_mean_k)))
+  {
+    pcl::StatisticalOutlierRemoval<pcl::PointXYZ> sor(true);
+    sor.setInputCloud(after_ror.makeShared());
+    sor.setMeanK(std::max(3, sor_mean_k));
+    sor.setStddevMulThresh(std::max(0.1, sor_stddev_mul));
+    sor.filter(after_sor);
+  }
+  finishCloud(after_sor);
+  out = std::move(after_sor);
 }
 
 void preprocessDepthCloud(
@@ -148,17 +267,32 @@ void preprocessDepthCloud(
   st.voxel = voxel.size();
   if (voxel.empty()) {finishCloud(filtered); finishCloud(deviate); return;}
 
+  CloudT after_hist = voxel;
+  if (params.depth_xy_hist_enable && !voxel.empty()) {
+    CloudT hist_removed;
+    xyDensityFilter(
+      voxel, after_hist,
+      params.depth_xy_hist_cell, params.depth_xy_hist_min_points,
+      params.depth_xy_hist_range_scale, params.depth_xy_hist_min_points_far,
+      params.depth_range_max, &hist_removed);
+    st.xy_hist_drop = hist_removed.size();
+    if (!hist_removed.empty()) {
+      deviate += hist_removed;
+      finishCloud(deviate);
+    }
+  }
+
   // Optional ROR coarse reject when the cloud is dense enough, then SOR refine.
-  CloudT after_ror = voxel;
+  CloudT after_ror = after_hist;
   if (params.depth_ror_enable &&
-    voxel.size() >= static_cast<size_t>(std::max(1, params.depth_ror_min_points)))
+    after_hist.size() >= static_cast<size_t>(std::max(1, params.depth_ror_min_points)))
   {
     pcl::RadiusOutlierRemoval<pcl::PointXYZ> ror(true);
-    ror.setInputCloud(voxel.makeShared());
+    ror.setInputCloud(after_hist.makeShared());
     ror.setRadiusSearch(std::max(1e-4, params.depth_ror_radius));
     ror.setMinNeighborsInRadius(std::max(1, params.depth_ror_min_neighbors));
     ror.filter(after_ror);
-    appendRemoved(voxel, ror.getRemovedIndices(), deviate, st.ror_drop);
+    appendRemoved(after_hist, ror.getRemovedIndices(), deviate, st.ror_drop);
   }
   finishCloud(after_ror);
 
@@ -368,6 +502,92 @@ void collectWallSupportResiduals(
   global = accumulateResiduals(all_signed);
 }
 
+constexpr int kResidualTextIdBase = 100;
+
+double residualDisplayScale(const std::string & unit)
+{
+  if (unit == "cm") {return 100.0;}
+  if (unit == "m") {return 1.0;}
+  return 1000.0;  // mm default
+}
+
+const char * residualDisplayUnitLabel(const std::string & unit)
+{
+  if (unit == "cm") {return "cm";}
+  if (unit == "m") {return "m";}
+  return "mm";
+}
+
+std::string formatWallResidualText(size_t wi, const ResidualStats & s, const std::string & unit)
+{
+  const double scale = residualDisplayScale(unit);
+  const char * ul = residualDisplayUnitLabel(unit);
+  std::ostringstream oss;
+  oss << "W" << wi << " |e|=";
+  if (s.count == 0) {
+    oss << "n/a n=0";
+    return oss.str();
+  }
+  if (unit == "m") {
+    oss << std::fixed << std::setprecision(4) << (s.mean_abs * scale) << ul
+      << " rms=" << (s.rms * scale) << ul;
+  } else if (unit == "cm") {
+    oss << std::fixed << std::setprecision(2) << (s.mean_abs * scale) << ul
+      << " rms=" << (s.rms * scale) << ul;
+  } else {
+    oss << std::fixed << std::setprecision(1) << (s.mean_abs * scale) << ul
+      << " rms=" << (s.rms * scale) << ul;
+  }
+  oss << " n=" << s.count;
+  return oss.str();
+}
+
+/** TEXT_VIEW_FACING at wall mid (XY), z=(z_min+z_max)/2 + offset. Clears ns via DELETEALL. */
+void appendWallResidualTextMarkers(
+  const std::vector<WallLine> & lines_out,
+  const std::vector<ResidualStats> & per_wall,
+  double z_min_fallback, double z_max_fallback,
+  double z_offset, double text_size, double lifetime_sec,
+  const std::string & unit,
+  const std_msgs::msg::Header & header,
+  const std::string & ns,
+  visualization_msgs::msg::MarkerArray & markers)
+{
+  using Marker = visualization_msgs::msg::Marker;
+  Marker clear;
+  clear.header = header;
+  clear.ns = ns;
+  clear.id = 0;
+  clear.action = Marker::DELETEALL;
+  markers.markers.push_back(clear);
+
+  for (size_t i = 0; i < lines_out.size(); ++i) {
+    const WallLine & line = lines_out[i];
+    const ResidualStats & s = (i < per_wall.size()) ? per_wall[i] : ResidualStats{};
+    Marker t;
+    t.header = header;
+    t.ns = ns;
+    t.id = kResidualTextIdBase + static_cast<int>(i);
+    t.type = Marker::TEXT_VIEW_FACING;
+    t.action = Marker::ADD;
+    const Eigen::Vector2d mid = 0.5 * (line.a + line.b);
+    const double z0 = std::isfinite(line.z_min) ? line.z_min : z_min_fallback;
+    const double z1 = std::isfinite(line.z_max) ? line.z_max : z_max_fallback;
+    t.pose.position.x = mid.x();
+    t.pose.position.y = mid.y();
+    t.pose.position.z = 0.5 * (z0 + z1) + z_offset;
+    t.pose.orientation.w = 1.0;
+    t.scale.z = std::max(1e-3, text_size);
+    t.color.r = 1.0f;
+    t.color.g = 1.0f;
+    t.color.b = 1.0f;
+    t.color.a = 1.0f;
+    t.lifetime = rclcpp::Duration::from_seconds(std::max(0.0, lifetime_sec));
+    t.text = formatWallResidualText(i, s, unit);
+    markers.markers.push_back(t);
+  }
+}
+
 void finalizeWallGeometry(
   std::vector<WallLine> & lines, const CloudT * support_cloud, const HoughConfig & hough,
   const Params & params)
@@ -558,6 +778,19 @@ void WallPlaneFilterNode::loadParams()
   take("wall_display_z", params_.wall_display_z, d.wall_display_z);
   take("wall_marker_lifetime", params_.wall_marker_lifetime, d.wall_marker_lifetime);
   take("wall_marker_publish_hz", params_.wall_marker_publish_hz, d.wall_marker_publish_hz);
+  take(
+    "wall_residual_marker_enable", params_.wall_residual_marker_enable,
+    d.wall_residual_marker_enable);
+  take(
+    "wall_residual_marker_z_offset", params_.wall_residual_marker_z_offset,
+    d.wall_residual_marker_z_offset);
+  take("wall_residual_text_size", params_.wall_residual_text_size, d.wall_residual_text_size);
+  take("wall_residual_unit", params_.wall_residual_unit, d.wall_residual_unit);
+  if (params_.wall_residual_unit != "mm" && params_.wall_residual_unit != "cm" &&
+    params_.wall_residual_unit != "m")
+  {
+    params_.wall_residual_unit = "mm";
+  }
   take("depth_clean_enable", params_.depth_clean_enable, d.depth_clean_enable);
   take("depth_topics", params_.depth_topics, d.depth_topics);
   take("depth_wall_cameras", params_.depth_wall_cameras, d.depth_wall_cameras);
@@ -566,6 +799,15 @@ void WallPlaneFilterNode::loadParams()
   take("depth_range_min", params_.depth_range_min, d.depth_range_min);
   take("depth_range_max", params_.depth_range_max, d.depth_range_max);
   take("depth_voxel_xy", params_.depth_voxel_xy, d.depth_voxel_xy);
+  take("depth_xy_hist_enable", params_.depth_xy_hist_enable, d.depth_xy_hist_enable);
+  take("depth_xy_hist_cell", params_.depth_xy_hist_cell, d.depth_xy_hist_cell);
+  take("depth_xy_hist_min_points", params_.depth_xy_hist_min_points, d.depth_xy_hist_min_points);
+  take(
+    "depth_xy_hist_range_scale", params_.depth_xy_hist_range_scale,
+    d.depth_xy_hist_range_scale);
+  take(
+    "depth_xy_hist_min_points_far", params_.depth_xy_hist_min_points_far,
+    d.depth_xy_hist_min_points_far);
   take("depth_ror_enable", params_.depth_ror_enable, d.depth_ror_enable);
   take("depth_ror_min_points", params_.depth_ror_min_points, d.depth_ror_min_points);
   take("depth_ror_radius", params_.depth_ror_radius, d.depth_ror_radius);
@@ -598,6 +840,25 @@ void WallPlaneFilterNode::loadParams()
   take("range_min", params_.range_min, d.range_min);
   take("range_max", params_.range_max, d.range_max);
   take("voxel_leaf", params_.voxel_leaf, d.voxel_leaf);
+  take("lidar_xy_hist_enable", params_.lidar_xy_hist_enable, d.lidar_xy_hist_enable);
+  take("lidar_xy_hist_cell", params_.lidar_xy_hist_cell, d.lidar_xy_hist_cell);
+  take("lidar_xy_hist_min_points", params_.lidar_xy_hist_min_points, d.lidar_xy_hist_min_points);
+  take(
+    "lidar_xy_hist_range_scale", params_.lidar_xy_hist_range_scale,
+    d.lidar_xy_hist_range_scale);
+  take(
+    "lidar_xy_hist_min_points_far", params_.lidar_xy_hist_min_points_far,
+    d.lidar_xy_hist_min_points_far);
+  take("lidar_ror_enable", params_.lidar_ror_enable, d.lidar_ror_enable);
+  take("lidar_ror_min_points", params_.lidar_ror_min_points, d.lidar_ror_min_points);
+  take("lidar_ror_radius", params_.lidar_ror_radius, d.lidar_ror_radius);
+  take("lidar_ror_min_neighbors", params_.lidar_ror_min_neighbors, d.lidar_ror_min_neighbors);
+  take("lidar_sor_enable", params_.lidar_sor_enable, d.lidar_sor_enable);
+  take("lidar_sor_mean_k", params_.lidar_sor_mean_k, d.lidar_sor_mean_k);
+  take("lidar_sor_stddev_mul", params_.lidar_sor_stddev_mul, d.lidar_sor_stddev_mul);
+  take("lidar_bilateral_enable", params_.lidar_bilateral_enable, d.lidar_bilateral_enable);
+  take("lidar_bilateral_sigma_s", params_.lidar_bilateral_sigma_s, d.lidar_bilateral_sigma_s);
+  take("lidar_bilateral_sigma_r", params_.lidar_bilateral_sigma_r, d.lidar_bilateral_sigma_r);
   take("lidar_wall_range_max", params_.lidar_wall_range_max, d.lidar_wall_range_max);
   take("corner_snap_enable", params_.corner_snap_enable, d.corner_snap_enable);
   take("corner_snap_dist", params_.corner_snap_dist, d.corner_snap_dist);
@@ -673,11 +934,21 @@ void WallPlaneFilterNode::loadParams()
 
   if (!(params_.depth_range_max > 0.0) || !(params_.depth_z_max > params_.depth_z_min) ||
     !(params_.depth_voxel_xy > 0.0) || params_.depth_sor_mean_k < 3 ||
+    !(params_.depth_xy_hist_cell > 0.0) || params_.depth_xy_hist_min_points < 1 ||
+    params_.depth_xy_hist_min_points_far < 1 ||
+    params_.depth_xy_hist_min_points_far > params_.depth_xy_hist_min_points ||
     !(params_.depth_ror_radius > 0.0) || params_.depth_ror_min_neighbors < 1 ||
     params_.depth_ror_min_points < 1 ||
     !(params_.depth_bilateral_sigma_s > 0.0) || !(params_.depth_bilateral_sigma_r > 0.0) ||
-    !(params_.wall_marker_lifetime > 0.0) || !(params_.z_max > params_.z_min) ||
+    !(params_.wall_marker_lifetime > 0.0) || !(params_.wall_residual_text_size > 0.0) ||
+    !(params_.z_max > params_.z_min) ||
     !(params_.range_max > params_.range_min) || !(params_.voxel_leaf > 0.0) ||
+    !(params_.lidar_xy_hist_cell > 0.0) || params_.lidar_xy_hist_min_points < 1 ||
+    params_.lidar_xy_hist_min_points_far < 1 ||
+    params_.lidar_xy_hist_min_points_far > params_.lidar_xy_hist_min_points ||
+    params_.lidar_sor_mean_k < 3 || !(params_.lidar_ror_radius > 0.0) ||
+    params_.lidar_ror_min_neighbors < 1 || params_.lidar_ror_min_points < 1 ||
+    !(params_.lidar_bilateral_sigma_s > 0.0) || !(params_.lidar_bilateral_sigma_r > 0.0) ||
     !(params_.lidar_wall_range_max > 0.0) || !(params_.wall_extent_margin_m >= 0.0) ||
     !(params_.corner_snap_dist >= 0.0))
   {
@@ -858,7 +1129,7 @@ void WallPlaneFilterNode::cloudCallback(
   }
   finishCloud(roi);
 
-  CloudT filtered = roi;
+  CloudT voxel = roi;
   if (!roi.empty() && params_.voxel_leaf > 1e-9) {
     pcl::VoxelGrid<pcl::PointXYZ> vg;
     vg.setInputCloud(roi.makeShared());
@@ -866,9 +1137,44 @@ void WallPlaneFilterNode::cloudCallback(
       static_cast<float>(params_.voxel_leaf),
       static_cast<float>(params_.voxel_leaf),
       static_cast<float>(params_.voxel_leaf));
-    vg.filter(filtered);
-    finishCloud(filtered);
+    vg.filter(voxel);
+    finishCloud(voxel);
   }
+
+  CloudT after_hist = voxel;
+  if (params_.lidar_xy_hist_enable && !voxel.empty()) {
+    xyDensityFilter(
+      voxel, after_hist,
+      params_.lidar_xy_hist_cell, params_.lidar_xy_hist_min_points,
+      params_.lidar_xy_hist_range_scale, params_.lidar_xy_hist_min_points_far,
+      params_.range_max);
+    RCLCPP_DEBUG_THROTTLE(
+      get_logger(), *get_clock(), 2000,
+      "lidar xy_hist voxel=%zu kept=%zu drop=%zu cell=%.3f min=%d far=%d",
+      voxel.size(), after_hist.size(),
+      voxel.size() >= after_hist.size() ? voxel.size() - after_hist.size() : 0u,
+      params_.lidar_xy_hist_cell, params_.lidar_xy_hist_min_points,
+      params_.lidar_xy_hist_min_points_far);
+  }
+
+  CloudT after_sor;
+  applyRorSor(
+    after_hist, after_sor,
+    params_.lidar_ror_enable, params_.lidar_ror_min_points,
+    params_.lidar_ror_radius, params_.lidar_ror_min_neighbors,
+    params_.lidar_sor_enable, params_.lidar_sor_mean_k, params_.lidar_sor_stddev_mul);
+
+  CloudT filtered;
+  if (params_.lidar_bilateral_enable && !after_sor.empty()) {
+    if (!bilateralSmoothXyz(
+        after_sor, filtered, params_.lidar_bilateral_sigma_s, params_.lidar_bilateral_sigma_r))
+    {
+      filtered = std::move(after_sor);
+    }
+  } else {
+    filtered = std::move(after_sor);
+  }
+  finishCloud(filtered);
 
   if (params_.publish_cloud_filtered && (lidar_filtered_pub_ || lidar_filtered_pub_be_)) {
     CloudT filtered_world;
@@ -916,11 +1222,12 @@ void WallPlaneFilterNode::cloudCallback(
     "lidar wall track obs=%d matched=%d coast=%d expire=%d out=%d extract=%zu extractor=%s",
     stats.obs, stats.matched, stats.coasting, stats.expired, stats.confirmed_out,
     result.lines.size(), params_.lidar_hough.extractor.c_str());
-  publishLidarWalls(tracked, stamp, world);
+  publishLidarWalls(tracked, stamp, world, &wall_world);
 }
 
 void WallPlaneFilterNode::publishLidarWalls(
-  const std::vector<WallLine> & lines, const rclcpp::Time & stamp, const std::string & frame)
+  const std::vector<WallLine> & lines, const rclcpp::Time & stamp, const std::string & frame,
+  const CloudT * support_cloud)
 {
   if (!lidar_wall_plane_pub_ || !lidar_wall_marker_pub_) {return;}
   const std::string output = outputFrame();
@@ -948,9 +1255,12 @@ void WallPlaneFilterNode::publishLidarWalls(
   faces.scale.x = faces.scale.y = faces.scale.z = 1.0;
   faces.color.a = 0.30f;
 
+  std::vector<WallLine> lines_out;
+  lines_out.reserve(lines.size());
   if (tf_ok) {
     for (const auto & line_in : lines) {
       WallLine line = (output == frame) ? line_in : transformLine(line_in, T);
+      lines_out.push_back(line);
       planes.planes.push_back(
         toWallPlaneMsg(line, params_.lidar_hough.z_min, params_.lidar_hough.z_max));
       const auto & pl = planes.planes.back();
@@ -977,6 +1287,31 @@ void WallPlaneFilterNode::publishLidarWalls(
   } else {
     markers.markers.push_back(edges);
     markers.markers.push_back(faces);
+  }
+
+  const std::string residual_ns = "lidar_wall_residuals";
+  if (params_.wall_residual_marker_enable && support_cloud && tf_ok && !lines.empty()) {
+    std::vector<ResidualStats> per_wall;
+    ResidualStats global;
+    std::vector<double> all_abs;
+    collectWallSupportResiduals(
+      lines, *support_cloud, params_.lidar_hough.support_band, per_wall, global, all_abs);
+    RCLCPP_INFO_THROTTLE(
+      get_logger(), *get_clock(), 2000,
+      "wall residual lidar walls=%zu pts=%zu |e| mean=%.4f rms=%.4f max=%.4f",
+      lines.size(), global.count, global.mean_abs, global.rms, global.max_abs);
+    appendWallResidualTextMarkers(
+      lines_out, per_wall, params_.lidar_hough.z_min, params_.lidar_hough.z_max,
+      params_.wall_residual_marker_z_offset, params_.wall_residual_text_size,
+      params_.wall_marker_lifetime, params_.wall_residual_unit, planes.header, residual_ns,
+      markers);
+  } else {
+    Marker clear;
+    clear.header = planes.header;
+    clear.ns = residual_ns;
+    clear.id = 0;
+    clear.action = Marker::DELETEALL;
+    markers.markers.push_back(clear);
   }
   lidar_wall_marker_pub_->publish(markers);
 }
@@ -1038,10 +1373,10 @@ void WallPlaneFilterNode::depthCallback(
   preprocessDepthCloud(raw, T_bc, params_, filtered, deviate, prep);
   RCLCPP_INFO_THROTTLE(
     get_logger(), *get_clock(), 2000,
-    "depth preprocess camera=%s crop=%zu voxel_xy=%zu ror_drop=%zu sor_drop=%zu bilateral=%d "
-    "out=%zu z=[%.2f,%.2f] range=%.2f xy=%.3f",
-    depth_cam_names_[idx].c_str(), prep.crop, prep.voxel, prep.ror_drop, prep.sor_drop,
-    prep.bilateral ? 1 : 0, prep.out, params_.depth_z_min, params_.depth_z_max,
+    "depth preprocess camera=%s crop=%zu voxel_xy=%zu xy_hist_drop=%zu ror_drop=%zu "
+    "sor_drop=%zu bilateral=%d out=%zu z=[%.2f,%.2f] range=%.2f xy=%.3f",
+    depth_cam_names_[idx].c_str(), prep.crop, prep.voxel, prep.xy_hist_drop, prep.ror_drop,
+    prep.sor_drop, prep.bilateral ? 1 : 0, prep.out, params_.depth_z_min, params_.depth_z_max,
     params_.depth_range_max, params_.depth_voxel_xy);
 
   DepthSlot slot;
@@ -1154,12 +1489,12 @@ void WallPlaneFilterNode::processDepthWalls(
     "wall track %s obs=%d matched=%d coast=%d expire=%d out=%d extract=%zu",
     depth_cam_names_[idx].c_str(), stats.obs, stats.matched, stats.coasting, stats.expired,
     stats.confirmed_out, result.lines.size());
-  publishCamWalls(idx, cam_tracked, stamp, wallWorkFrame());
+  publishCamWalls(idx, cam_tracked, stamp, wallWorkFrame(), &wall_world);
 }
 
 void WallPlaneFilterNode::publishCamWalls(
   size_t idx, const std::vector<WallLine> & lines, const rclcpp::Time & stamp,
-  const std::string & frame)
+  const std::string & frame, const CloudT * support_cloud)
 {
   if (idx >= depth_cam_plane_pubs_.size()) {return;}
   const std::string output = outputFrame();
@@ -1174,6 +1509,7 @@ void WallPlaneFilterNode::publishCamWalls(
     {1.00f, 0.40f, 0.90f}, {0.35f, 0.65f, 1.00f}};
   const auto & rgb = kRgb[idx % 4];
   const std::string ns = depth_cam_names_[idx] + "_walls";
+  const std::string residual_ns = depth_cam_names_[idx] + "_wall_residuals";
   using Marker = visualization_msgs::msg::Marker;
   Marker edges;
   edges.header = planes.header;
@@ -1192,9 +1528,12 @@ void WallPlaneFilterNode::publishCamWalls(
   faces.scale.x = faces.scale.y = faces.scale.z = 1.0;
   faces.color.a = 0.35f;
 
+  std::vector<WallLine> lines_out;
+  lines_out.reserve(lines.size());
   if (tf_ok) {
     for (const auto & line_in : lines) {
       WallLine line = (output == frame) ? line_in : transformLine(line_in, T);
+      lines_out.push_back(line);
       planes.planes.push_back(
         toWallPlaneMsg(line, params_.depth_hough.z_min, params_.depth_hough.z_max));
       const auto & pl = planes.planes.back();
@@ -1207,9 +1546,42 @@ void WallPlaneFilterNode::publishCamWalls(
     }
   }
   depth_cam_plane_pubs_[idx]->publish(planes);
+
   if (!edges.points.empty()) {
     markers.markers.push_back(edges);
     markers.markers.push_back(faces);
+  } else {
+    Marker del;
+    del.header = planes.header;
+    del.ns = ns;
+    del.id = 0;
+    del.action = Marker::DELETE;
+    markers.markers.push_back(del);
+    del.ns = depth_cam_names_[idx] + "_wall_planes";
+    del.id = 1;
+    markers.markers.push_back(del);
+  }
+
+  if (params_.wall_residual_marker_enable && support_cloud && tf_ok && !lines.empty()) {
+    std::vector<ResidualStats> per_wall;
+    ResidualStats global;
+    std::vector<double> all_abs;
+    collectWallSupportResiduals(
+      lines, *support_cloud, params_.depth_hough.support_band, per_wall, global, all_abs);
+    appendWallResidualTextMarkers(
+      lines_out, per_wall, params_.depth_hough.z_min, params_.depth_hough.z_max,
+      params_.wall_residual_marker_z_offset, params_.wall_residual_text_size,
+      params_.wall_marker_lifetime, params_.wall_residual_unit, planes.header, residual_ns,
+      markers);
+  } else {
+    Marker clear;
+    clear.header = planes.header;
+    clear.ns = residual_ns;
+    clear.id = 0;
+    clear.action = Marker::DELETEALL;
+    markers.markers.push_back(clear);
+  }
+  if (idx < depth_cam_marker_pubs_.size() && depth_cam_marker_pubs_[idx]) {
     depth_cam_marker_pubs_[idx]->publish(markers);
   }
 }

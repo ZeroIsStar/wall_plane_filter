@@ -7,18 +7,40 @@ wall_plane_filter:
     wall_display_z: 0.10             # 显示用参考高度（米，部分可视化）
     wall_marker_lifetime: 3.00       # Marker 生命周期（秒）
     wall_marker_publish_hz: 20.0     # Marker 发布上限 Hz（≤0 表示每帧都发）
+    # 每面墙支撑点到墙拟合误差 TEXT（RViz Marker）；残差带宽用对应 hough.support_band
+    wall_residual_marker_enable: true   # 是否在墙 Marker 上显示 |e| 均值/RMS
+    wall_residual_marker_z_offset: 0.15 # 文字相对墙中点高度上抬（米）
+    wall_residual_text_size: 0.08       # 文字高度（米，Marker scale.z）
+    wall_residual_unit: mm              # 显示单位：mm | cm | m
 
-    # ========== 雷达墙（ROI + 体素 → extract → WallTracker+KF）==========
+    # ========== 雷达墙（ROI → 体素 → XY直方图 → ROR → SOR → bilateral → extract → WallTracker+KF）==========
     # 订阅雷达点云；发布 /wall_plane_filter/lidar_wall_planes 与 lidar_wall_markers
     # 水平距离统一 3m：ROI 与找墙输入一致
+    # 预处理顺序：ROI → VoxelGrid → 可选 XY 密度直方图 → 可选 ROR 粗剔 → 可选 SOR 精修 → 可选 bilateral（无 deviate）
     cloud_topic: /vanjee/lidar       # 雷达 PointCloud2 话题
     lidar_wall_enable: true          # 是否做雷达找墙与 Marker
-    publish_cloud_filtered: false    # 是否发布 /wall_plane_filter/cloud_filtered（过滤后保留点）
+    publish_cloud_filtered: true     # 是否发布 /wall_plane_filter/cloud_filtered（过滤后保留点）
     z_min: 0.05                      # 雷达 ROI：最低高度（target_frame，米）
     z_max: 1.80                      # 雷达 ROI：最高高度（米）
     range_min: 0.20                  # 雷达 ROI：水平距离下限（米）
     range_max: 3.0                   # 雷达 ROI：水平距离上限（米，与深度一致）
     voxel_leaf: 0.05                 # 雷达各向同性体素边长（米）
+    # XY 密度直方图：Voxel 之后、ROR 之前；低密度格整格删除（固定点数阈值）
+    lidar_xy_hist_enable: true       # 是否启用 XY 密度直方图去噪
+    lidar_xy_hist_cell: 0.10         # XY 格子边长（米），约 2× voxel_leaf
+    lidar_xy_hist_min_points: 20      # 格内点数 < 此则删整格（近距阈值）
+    lidar_xy_hist_range_scale: true  # 是否随水平距离放宽阈值
+    lidar_xy_hist_min_points_far: 2  # range_max 附近的最低阈值
+    lidar_ror_enable: true           # 是否启用半径离群粗剔（点数够时）
+    lidar_ror_min_points: 10        # 体素后点数少于此则跳过 ROR
+    lidar_ror_radius: 0.10           # ROR 搜索半径（米）
+    lidar_ror_min_neighbors: 4       # 半径内最少邻域点数（含自身规则以 PCL 为准）
+    lidar_sor_enable: true           # 是否启用统计离群精修
+    lidar_sor_mean_k: 5             # SOR 邻域点数 K
+    lidar_sor_stddev_mul: 1.0        # SOR 标准差倍数（越大越宽松）
+    lidar_bilateral_enable: true     # 是否启用几何双边平滑
+    lidar_bilateral_sigma_s: 0.04    # 双边空间 sigma（米）
+    lidar_bilateral_sigma_r: 0.03    # 双边值域 sigma（|Δz|，米）
     lidar_wall_range_max: 3.0        # 找墙用水平距离上限（米，≤ range_max）
 
     # ========== 拐角锁 / 墙面支撑夹紧（深度与雷达共用）==========
@@ -42,21 +64,28 @@ wall_plane_filter:
 
     # ---------- 深度预处理（严格顺序）----------
     # 1) crop：Z∈[depth_z_min, depth_z_max]，水平距离∈[depth_range_min, depth_range_max]
-    # 2) 各向同性 VoxelGrid：leaf×leaf×leaf（默认 2cm×2cm×2cm）
-    # 3) 点数 ≥ depth_ror_min_points 时 RadiusOutlierRemoval 粗剔（可选）
-    # 4) StatisticalOutlierRemoval 精修（可选）
-    # 5) bilateral：几何双边平滑（对 XYZ）→ filtered=保留点；ROR/SOR 剔除进 deviate
+    # 2) 各向同性 VoxelGrid：leaf×leaf×leaf
+    # 3) 可选 XY 密度直方图（固定点数阈值）；剔除点进 deviate
+    # 4) 点数 ≥ depth_ror_min_points 时 RadiusOutlierRemoval 粗剔（可选）
+    # 5) StatisticalOutlierRemoval 精修（可选）
+    # 6) bilateral：几何双边平滑（对 XYZ）→ filtered=保留点；ROR/SOR/XY直方图剔除进 deviate
     depth_z_min: 0.05                # 深度 ROI 最低高度（米）
     depth_z_max: 1.70                # 深度 ROI 最高高度（米）
     depth_range_min: 0.10            # 深度 ROI 水平距离下限（米）
     depth_range_max: 3.0             # 深度 ROI 水平距离上限（米）
     depth_voxel_xy: 0.05             # 体素边长（米），XYZ 同为 leaf（2cm×2cm×2cm）
+    # XY 密度直方图：Voxel 之后、ROR 之前；低密度格整格删除，剔除进 deviate
+    depth_xy_hist_enable: true       # 是否启用 XY 密度直方图去噪
+    depth_xy_hist_cell: 0.10         # XY 格子边长（米），约 2× depth_voxel_xy
+    depth_xy_hist_min_points: 20      # 格内点数 < 此则删整格（近距阈值）
+    depth_xy_hist_range_scale: true  # 是否随水平距离放宽阈值
+    depth_xy_hist_min_points_far: 2  # depth_range_max 附近的最低阈值
     depth_ror_enable: true           # 是否启用半径离群粗剔（点数够时）
-    depth_ror_min_points: 200        # 体素后点数少于此则跳过 ROR
-    depth_ror_radius: 0.05           # ROR 搜索半径（米）
+    depth_ror_min_points: 25        # 体素后点数少于此则跳过 ROR
+    depth_ror_radius: 0.10           # ROR 搜索半径（米）
     depth_ror_min_neighbors: 4       # 半径内最少邻域点数（含自身规则以 PCL 为准）
     depth_sor_enable: true           # 是否启用统计离群精修
-    depth_sor_mean_k: 20             # SOR 邻域点数 K
+    depth_sor_mean_k: 5             # SOR 邻域点数 K
     depth_sor_stddev_mul: 1.0        # SOR 标准差倍数（越大越宽松）
     depth_bilateral_enable: true     # 是否启用几何双边平滑
     depth_bilateral_sigma_s: 0.04    # 双边空间 sigma（米）
@@ -99,7 +128,7 @@ wall_plane_filter:
     # depth_hough / lidar_hough 可分别配置。
 
     depth_hough:
-      extractor: hough               # 找线算法：hough | ransac | seed_grow
+      extractor: seed_grow               # 找线算法：hough | ransac | seed_grow
       resolution: 0.05               # 占据栅格分辨率（米/格）
       half_extent: 3.0               # 栅格半边长（米）；与 3m ROI 一致
       max_grid_side: 512             # 栅格单边最大格数
@@ -139,7 +168,7 @@ wall_plane_filter:
       grow_max_range_jump: 0.35      # 生长相邻分箱最大距离跳变（米）
 
     lidar_hough:
-      extractor: hough               # 找线算法：hough | ransac | seed_grow
+      extractor: seed_grow               # 找线算法：hough | ransac | seed_grow
       resolution: 0.05               # 占据栅格分辨率（米/格）
       half_extent: 3.0               # 栅格半边长（米）；与 3m ROI 一致
       max_grid_side: 512             # 栅格单边最大格数

@@ -38,19 +38,22 @@ ros2 run wall_plane_filter wall_plane_filter_node --ros-args \
 
 1. TF 到 `target_frame`，ROI 裁剪（高度 + 水平距离）  
 2. 各向同性 `VoxelGrid`（`depth_voxel_xy`³）  
-3. 点数 ≥ `depth_ror_min_points` 时 **ROR 粗剔** → **SOR 精修**（剔除进 deviate）  
-4. 几何 Bilateral 平滑 → `depth_cloud_filtered`  
-5. TF 到 `map`，按 `depth_hough.extractor` 找线 → 每相机 `WallTracker`+KF  
-6. `clampWallsToSupportCloud` + `snapWallCorners`  
-7. 多相机融合墙线（用于发布前 `cullWallBand`）  
-8. 发布 `wall_planes` / `wall_markers`；对点云做墙带投影/剔除后发布 filtered / deviate  
+3. 可选 **XY 密度直方图**（`depth_xy_hist_*`）：低密度格整格删除（进 deviate）  
+4. 点数 ≥ `depth_ror_min_points` 时 **ROR 粗剔** → **SOR 精修**（剔除进 deviate）  
+5. 几何 Bilateral 平滑 → `depth_cloud_filtered`  
+6. TF 到 `map`，按 `depth_hough.extractor` 找线 → 每相机 `WallTracker`+KF  
+7. `clampWallsToSupportCloud` + `snapWallCorners`  
+8. 多相机融合墙线（用于发布前 `cullWallBand`）  
+9. 发布 `wall_planes` / `wall_markers`；对点云做墙带投影/剔除后发布 filtered / deviate  
 
 ### 雷达
 
-1. TF 到 `target_frame`，ROI + 各向同性体素  
-2. 可选发布 `/wall_plane_filter/cloud_filtered`  
-3. 水平距离 ≤ `lidar_wall_range_max` 找墙 → `lidar_hough.extractor` → 共用 `wall_track` 的 `lidar_tracks_`  
-4. 支撑夹紧 + 拐角吸附 → `/wall_plane_filter/lidar_wall_planes`、`lidar_wall_markers`  
+1. TF 到 `target_frame`，ROI + 各向同性体素（`voxel_leaf`³）  
+2. 可选 **XY 密度直方图**（`lidar_xy_hist_*`）：低密度格整格删除  
+3. 点数 ≥ `lidar_ror_min_points` 时 **ROR 粗剔** → **SOR 精修**（无 deviate 话题）  
+4. 几何 Bilateral 平滑 → 可选发布 `/wall_plane_filter/cloud_filtered`  
+5. 水平距离 ≤ `lidar_wall_range_max` 找墙 → `lidar_hough.extractor` → 共用 `wall_track` 的 `lidar_tracks_`  
+6. 支撑夹紧 + 拐角吸附 → `/wall_plane_filter/lidar_wall_planes`、`lidar_wall_markers`  
 
 ### extractor
 
@@ -80,10 +83,10 @@ ros2 run wall_plane_filter wall_plane_filter_node --ros-args \
 | `/wall_plane_filter/<cam>/depth_cloud_filtered` | 深度过滤后保留点 |
 | `/wall_plane_filter/<cam>/depth_cloud_deviate` | 深度剔除点 |
 | `/wall_plane_filter/<cam>/wall_planes` | 该相机墙平面数组 |
-| `/wall_plane_filter/<cam>/wall_markers` | 该相机墙 Marker |
+| `/wall_plane_filter/<cam>/wall_markers` | 该相机墙 Marker（含可选拟合误差 TEXT） |
 | `/wall_plane_filter/lidar_wall_planes` | 雷达墙平面 |
-| `/wall_plane_filter/lidar_wall_markers` | 雷达墙 Marker |
-| `/wall_plane_filter/cloud_filtered` | 可选，雷达 ROI+体素后点云 |
+| `/wall_plane_filter/lidar_wall_markers` | 雷达墙 Marker（含可选拟合误差 TEXT） |
+| `/wall_plane_filter/cloud_filtered` | 可选，雷达 ROI+体素+ROR+SOR+bilateral 后点云 |
 
 `WallPlane`：竖直墙矩形（法向在 XY，`a`/`b` 水平端点，`z_min`/`z_max`，`corners[4]`）。
 
@@ -103,6 +106,10 @@ ros2 run wall_plane_filter wall_plane_filter_node --ros-args \
 | `wall_display_z` | 显示参考高度（米） |
 | `wall_marker_lifetime` | Marker 生命周期（秒） |
 | `wall_marker_publish_hz` | Marker 发布上限 Hz；≤0 每帧都发 |
+| `wall_residual_marker_enable` | 墙 Marker 是否显示支撑点到墙 \|e\| 均值/RMS 文字 |
+| `wall_residual_marker_z_offset` | 文字相对墙中点高度上抬（米） |
+| `wall_residual_text_size` | 文字高度（米） |
+| `wall_residual_unit` | 显示单位：`mm` / `cm` / `m` |
 
 ### 雷达
 
@@ -114,6 +121,21 @@ ros2 run wall_plane_filter wall_plane_filter_node --ros-args \
 | `z_min` / `z_max` | 雷达 ROI 高度带（米） |
 | `range_min` / `range_max` | 雷达 ROI 水平距离（米） |
 | `voxel_leaf` | 雷达各向同性体素边长（米） |
+| `lidar_xy_hist_enable` | 是否启用 XY 密度直方图去噪（Voxel 后、ROR 前） |
+| `lidar_xy_hist_cell` | XY 格子边长（米） |
+| `lidar_xy_hist_min_points` | 格内点数低于此则删整格（近距） |
+| `lidar_xy_hist_range_scale` | 是否随水平距离放宽阈值 |
+| `lidar_xy_hist_min_points_far` | `range_max` 附近最低点数阈值 |
+| `lidar_ror_enable` | 是否启用 RadiusOutlierRemoval 粗剔 |
+| `lidar_ror_min_points` | 体素后点数少于此则跳过 ROR |
+| `lidar_ror_radius` | ROR 搜索半径（米） |
+| `lidar_ror_min_neighbors` | 半径内最少邻域点数 |
+| `lidar_sor_enable` | 是否启用 StatisticalOutlierRemoval 精修 |
+| `lidar_sor_mean_k` | SOR 邻域点数 K |
+| `lidar_sor_stddev_mul` | SOR 标准差倍数（越大越宽松） |
+| `lidar_bilateral_enable` | 是否几何双边平滑 |
+| `lidar_bilateral_sigma_s` | 双边空间 sigma（米） |
+| `lidar_bilateral_sigma_r` | 双边值域 sigma（\|Δz\|，米） |
 | `lidar_wall_range_max` | 找墙水平距离上限（米，≤ `range_max`） |
 
 ### 拐角 / 支撑夹紧（深度与雷达共用）
@@ -137,6 +159,11 @@ ros2 run wall_plane_filter wall_plane_filter_node --ros-args \
 | `depth_z_min` / `depth_z_max` | 深度 ROI 高度（米） |
 | `depth_range_min` / `depth_range_max` | 深度 ROI 水平距离（米） |
 | `depth_voxel_xy` | 各向同性体素边长 leaf（米），即 leaf×leaf×leaf |
+| `depth_xy_hist_enable` | 是否启用 XY 密度直方图去噪（Voxel 后、ROR 前） |
+| `depth_xy_hist_cell` | XY 格子边长（米） |
+| `depth_xy_hist_min_points` | 格内点数低于此则删整格（近距） |
+| `depth_xy_hist_range_scale` | 是否随水平距离放宽阈值 |
+| `depth_xy_hist_min_points_far` | `depth_range_max` 附近最低点数阈值 |
 | `depth_ror_enable` | 是否启用 RadiusOutlierRemoval 粗剔 |
 | `depth_ror_min_points` | 体素后点数少于此则跳过 ROR |
 | `depth_ror_radius` | ROR 搜索半径（米） |
