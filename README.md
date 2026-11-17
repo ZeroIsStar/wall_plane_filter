@@ -185,8 +185,8 @@ ros2 run wall_plane_filter wall_plane_filter_node --ros-args \
 | `depth_wall_noise_k` | 噪声带 = k·r²（相对传感器距离） |
 | `depth_wall_noise_max` | 噪声带上限（米） |
 | `depth_wall_range_max` | 找墙水平距离上限（米） |
-| `depth_wall_ground_margin` | 地面上抬切掉高度（米） |
-| `depth_ground_ref_z` | 地面参考高度（米） |
+| `depth_wall_ground_margin` | 找墙前地面上抬切除（米，**map / `depth_wall_map_frame` 的 z**）；丢掉 `map_z < ref+margin` |
+| `depth_ground_ref_z` | 地面参考高度（米，**map z**）；与 margin 组成 `floor_cut` |
 | `wall_fuse_min_support_points` | 多相机融合最小支撑点数 |
 | `depth_merge_max_age` | 融合墙结果最大时间差（秒） |
 | `depth_wall_tf_report_sec` | TF 失败率日志周期（秒） |

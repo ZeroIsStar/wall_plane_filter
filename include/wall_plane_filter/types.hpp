@@ -96,7 +96,8 @@ struct Params
   double depth_wall_noise_k{0.005};
   double depth_wall_noise_max{0.06};
   double depth_wall_range_max{3.0};
-  double depth_wall_ground_margin{0.08};
+  // Floor cut for wall finding: drop points with map_z < ref + margin (map frame).
+  double depth_wall_ground_margin{0.0};
   double depth_ground_ref_z{0.0};
   int wall_fuse_min_support_points{10};
   double depth_merge_max_age{0.5};

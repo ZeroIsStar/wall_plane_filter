@@ -6,7 +6,7 @@ wall_plane_filter:
     wall_line_width: 0.04            # Marker 线宽（米）
     wall_display_z: 0.10             # 显示用参考高度（米，部分可视化）
     wall_marker_lifetime: 3.00       # Marker 生命周期（秒）
-    wall_marker_publish_hz: 20.0     # Marker 发布上限 Hz（≤0 表示每帧都发）
+    wall_marker_publish_hz: 10.0     # Marker 发布上限 Hz（≤0 表示每帧都发）
     # 每面墙支撑点到墙拟合误差 TEXT（RViz Marker）；残差带宽用对应 hough.support_band
     wall_residual_marker_enable: true   # 是否在墙 Marker 上显示 |e| 均值/RMS
     wall_residual_marker_z_offset: 0.15 # 文字相对墙中点高度上抬（米）
@@ -20,8 +20,8 @@ wall_plane_filter:
     cloud_topic: /vanjee/lidar       # 雷达 PointCloud2 话题
     lidar_wall_enable: true          # 是否做雷达找墙与 Marker
     publish_cloud_filtered: true     # 是否发布 /wall_plane_filter/cloud_filtered（过滤后保留点）
-    z_min: 0.05                      # 雷达 ROI：最低高度（target_frame，米）
-    z_max: 1.80                      # 雷达 ROI：最高高度（米）
+    z_min: -0.4                      # 雷达 ROI：最低高度（target_frame，米）
+    z_max: 1.50                      # 雷达 ROI：最高高度（米）
     range_min: 0.20                  # 雷达 ROI：水平距离下限（米）
     range_max: 3.0                   # 雷达 ROI：水平距离上限（米，与深度一致）
     voxel_leaf: 0.05                 # 雷达各向同性体素边长（米）
@@ -69,19 +69,19 @@ wall_plane_filter:
     # 4) 点数 ≥ depth_ror_min_points 时 RadiusOutlierRemoval 粗剔（可选）
     # 5) StatisticalOutlierRemoval 精修（可选）
     # 6) bilateral：几何双边平滑（对 XYZ）→ filtered=保留点；ROR/SOR/XY直方图剔除进 deviate
-    depth_z_min: 0.05                # 深度 ROI 最低高度（米）
+    depth_z_min: -0.4                # 深度 ROI 最低高度（米）
     depth_z_max: 1.70                # 深度 ROI 最高高度（米）
     depth_range_min: 0.10            # 深度 ROI 水平距离下限（米）
     depth_range_max: 3.0             # 深度 ROI 水平距离上限（米）
-    depth_voxel_xy: 0.05             # 体素边长（米），XYZ 同为 leaf（2cm×2cm×2cm）
+    depth_voxel_xy: 0.02             # 体素边长（米），XYZ 同为 leaf（2cm×2cm×2cm）
     # XY 密度直方图：Voxel 之后、ROR 之前；低密度格整格删除，剔除进 deviate
     depth_xy_hist_enable: true       # 是否启用 XY 密度直方图去噪
-    depth_xy_hist_cell: 0.10         # XY 格子边长（米），约 2× depth_voxel_xy
-    depth_xy_hist_min_points: 20      # 格内点数 < 此则删整格（近距阈值）
+    depth_xy_hist_cell: 0.04         # XY 格子边长（米），约 2× depth_voxel_xy
+    depth_xy_hist_min_points: 5      # 格内点数 < 此则删整格（近距阈值）
     depth_xy_hist_range_scale: true  # 是否随水平距离放宽阈值
     depth_xy_hist_min_points_far: 2  # depth_range_max 附近的最低阈值
     depth_ror_enable: true           # 是否启用半径离群粗剔（点数够时）
-    depth_ror_min_points: 25        # 体素后点数少于此则跳过 ROR
+    depth_ror_min_points: 5          # 体素后点数少于此 则跳过 ROR
     depth_ror_radius: 0.10           # ROR 搜索半径（米）
     depth_ror_min_neighbors: 4       # 半径内最少邻域点数（含自身规则以 PCL 为准）
     depth_sor_enable: true           # 是否启用统计离群精修
@@ -93,15 +93,16 @@ wall_plane_filter:
 
     # ---------- 发布前墙带裁剪（跟踪之后）----------
     # |n·xy-ρ| ≤ band：保留并可投影到竖直墙；band~outer：甩到 deviate；更远：当障碍物保留
-    depth_wall_band_m: 0.05          # 贴墙内带宽度（米）
-    depth_wall_band_outer_m: 0.12    # 噪声外带上限（米）；介于 band~outer 的点进 deviate
-    depth_wall_project: true         # 带内点是否投影到墙平面
-    depth_wall_noise_k: 0.005        # 距离相关噪声带系数：k·r²
-    depth_wall_noise_max: 0.06       # 噪声带上限（米）
+    depth_wall_band_m: 0.02          # 贴墙内带宽度（米）
+    depth_wall_band_outer_m: 0.04    # 噪声外带上限（米）；介于 band~outer 的点进 deviate
+    depth_wall_project: false         # 带内点是否投影到墙平面
+    depth_wall_noise_k: 0.004        # 距离相关噪声带系数：k·r²
+    depth_wall_noise_max: 0.04       # 噪声带上限（米）
     depth_wall_range_max: 3.0        # 找墙用水平距离上限（米，与 depth_range_max 一致）
-    depth_wall_ground_margin: 0.08   # 地面上抬切掉高度（米）
-    depth_ground_ref_z: 0.0          # 地面参考高度（米）
-    wall_fuse_min_support_points: 10 # 多相机墙线融合最小支撑点数
+    # 找墙前按 map（depth_wall_map_frame）的 z 切除：丢掉 map_z < ref+margin 的点；点云仍留 base_link
+    depth_wall_ground_margin: 0.0    # 相对 depth_ground_ref_z 上抬切掉（米，map z）
+    depth_ground_ref_z: 0.0          # 地面参考高度（米，map z）
+    wall_fuse_min_support_points: 6 # 多相机墙线融合最小支撑点数
     depth_merge_max_age: 0.5         # 融合墙结果可用的最大时间差（秒）
     depth_wall_tf_report_sec: 5.0    # TF 失败率日志周期（秒）
 
@@ -137,11 +138,11 @@ wall_plane_filter:
       origin_y: -3.0                 # follow_sensor=false 时栅格原点 Y（米）
       min_cell_points: 3             # 栅格占用最少点数
       min_cell_height: 0.05          # 栅格占用最少高度跨度（米，hough 用）
-      z_min: 0.05                    # 找墙高度带下限（米）
+      z_min: -0.4                    # 找墙高度带下限（米）
       z_max: 1.70                    # 找墙高度带上限（米）
       theta_deg: 1.0                 # HoughLinesP 角度分辨率（度）
       votes: 10                      # HoughLinesP 最小投票数
-      min_line_length: 0.40          # 最短墙段长度（米）
+      min_line_length: 0.20          # 最短墙段长度（米）
       hough_max_gap: 0.15            # HoughLinesP 允许间隙（米）
       merge_angle_deg: 6.0           # 候选线合并最大夹角（度）
       merge_distance: 0.08           # 候选线合并法向距离门限（米）
@@ -151,7 +152,7 @@ wall_plane_filter:
       support_band: 0.12             # 支撑点到直线的法向带宽（米）
       min_support_ratio: 0.65        # 支撑区间命中比例下限（0~1）
       max_unsupported_gap: 0.20      # 允许的最大无支撑间隙（米）
-      min_continuous_support: 0.15   # 最短连续支撑长度（米）
+      min_continuous_support: 0.10   # 最短连续支撑长度（米）
       min_support_points: 8          # 最少支撑点数
       max_lines: 80                  # 单帧最多输出墙段数
       refine: true                   # 是否用支撑点 TLS 精修直线
@@ -161,7 +162,7 @@ wall_plane_filter:
       ransac_max_iterations: 150     # RANSAC 最大迭代次数
       ransac_downsample_leaf: 0.04   # RANSAC 前 XY 降采样边长（米）
       seed_contour_angle_deg: 1.0    # seed_grow 方位角分箱（度）
-      seed_min_points: 6             # 种子段最少点数
+      seed_min_points: 5             # 种子段最少点数
       seed_max_distance: 0.0         # 种子拟合距离阈值（米）；≤0 用 support_band
       grow_distance: 0.0             # 生长距离阈值（米）；≤0 用 support_band
       grow_max_gap_bins: 2           # 生长允许跨越的最大空分箱数
@@ -177,11 +178,11 @@ wall_plane_filter:
       origin_y: -3.0                 # follow_sensor=false 时栅格原点 Y（米）
       min_cell_points: 2             # 栅格占用最少点数
       min_cell_height: 0.05          # 栅格占用最少高度跨度（米）
-      z_min: 0.05                    # 找墙高度带下限（米）
+      z_min: -0.4                    # 找墙高度带下限（米）
       z_max: 1.80                    # 找墙高度带上限（米）
       theta_deg: 1.0                 # HoughLinesP 角度分辨率（度）
       votes: 8                       # HoughLinesP 最小投票数
-      min_line_length: 0.50          # 最短墙段长度（米）
+      min_line_length: 0.20          # 最短墙段长度（米）
       hough_max_gap: 0.20            # HoughLinesP 允许间隙（米）
       merge_angle_deg: 6.0           # 候选线合并最大夹角（度）
       merge_distance: 0.10           # 候选线合并法向距离门限（米）
@@ -191,7 +192,7 @@ wall_plane_filter:
       support_band: 0.15             # 支撑点到直线的法向带宽（米）
       min_support_ratio: 0.60        # 支撑区间命中比例下限（0~1）
       max_unsupported_gap: 0.25      # 允许的最大无支撑间隙（米）
-      min_continuous_support: 0.15   # 最短连续支撑长度（米）
+      min_continuous_support: 0.10   # 最短连续支撑长度（米）
       min_support_points: 8          # 最少支撑点数
       max_lines: 80                  # 单帧最多输出墙段数
       refine: true                   # 是否用支撑点 TLS 精修直线
@@ -201,7 +202,7 @@ wall_plane_filter:
       ransac_max_iterations: 150     # RANSAC 最大迭代次数
       ransac_downsample_leaf: 0.05   # RANSAC 前 XY 降采样边长（米）
       seed_contour_angle_deg: 1.0    # seed_grow 方位角分箱（度）
-      seed_min_points: 6             # 种子段最少点数
+      seed_min_points: 5             # 种子段最少点数
       seed_max_distance: 0.0         # 种子拟合距离阈值（米）；≤0 用 support_band
       grow_distance: 0.0             # 生长距离阈值（米）；≤0 用 support_band
       grow_max_gap_bins: 2           # 生长允许跨越的最大空分箱数

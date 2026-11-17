@@ -1387,17 +1387,25 @@ void WallPlaneFilterNode::depthCallback(
   slot.stamp = stamp;
 
   if (find_walls) {
+    // Ground cut uses map-frame Z (depth_wall_map_frame); cloud stays in base_link.
     const double floor_cut = params_.depth_ground_ref_z + params_.depth_wall_ground_margin;
+    const Eigen::Matrix3d R_wb = T_wb.linear();
+    const Eigen::Vector3d t_wb = T_wb.translation();
+    const double r20 = R_wb(2, 0), r21 = R_wb(2, 1), r22 = R_wb(2, 2), t2 = t_wb.z();
     const Eigen::Vector3d cam_b = T_bc.translation();
     const double noise_k = std::max(0.0, params_.depth_wall_noise_k);
+    const double z_lo = params_.depth_hough.z_min;
+    const double z_hi = params_.depth_hough.z_max;
+    const double range_max = params_.depth_wall_range_max;
     CloudT wall_base;
     wall_base.reserve(filtered.size());
     for (const auto & p : filtered.points) {
-      if (p.z < std::max(floor_cut, params_.depth_hough.z_min) ||
-        p.z > params_.depth_hough.z_max || std::hypot(p.x, p.y) > params_.depth_wall_range_max)
-      {
-        continue;
-      }
+      if (p.z < z_lo || p.z > z_hi || std::hypot(p.x, p.y) > range_max) {continue;}
+      // map_z = (R_wb * p + t_wb).z  — only the Z row, no full transform.
+      const double map_z =
+        r20 * static_cast<double>(p.x) + r21 * static_cast<double>(p.y) +
+        r22 * static_cast<double>(p.z) + t2;
+      if (map_z < floor_cut) {continue;}
       const double d = (Eigen::Vector3d(p.x, p.y, p.z) - cam_b).norm();
       if (noise_k * d * d > params_.depth_wall_noise_max) {continue;}
       wall_base.push_back(p);
